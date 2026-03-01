@@ -188,6 +188,42 @@ FR/OI閾値ベースのイベント分析。Train有意 → Test崩壊。
 - Fixed 50bpが最良 (SOL Test Sharpe=1.46)
 - **Tick/LOBデータなしでは本来の価値を発揮できない**
 
+### 18. FR/Basis Carry戦略
+
+| 戦略 | 概要 | Train | Test | 判定 |
+|------|------|-------|------|------|
+| Simple FR Carry | FR>0でロング | -2.7〜-24.6bp | -10.7〜-35.0bp | FAIL |
+| Basis Carry 8h | Basis>0でショート | ETH +25bp(p=0.07) | ETH -11bp(p=0.34) | FAIL (符号反転) |
+| FR Carry + VolAdj | vol調整 | 微改善 | 同等にマイナス | FAIL |
+
+**敗因**: FR収入(0.5-0.9bp/8h)がコスト(8bp往復)と方向リスクを大幅に下回る。
+
+### 19. ペアトレード
+
+| ペア | Cointegration p | Half-Life (Test) | Backtest | 判定 |
+|------|----------------|-----------------|----------|------|
+| ETH/BTC | 0.969 | 1220h | Train/Test符号反転 | FAIL |
+| SOL/ETH | 0.166 | 4584h | Train/Test符号反転 | FAIL |
+| SOL/BTC | 0.366 | 1359h | ≈0bp | FAIL |
+
+**敗因**: コインテグレーション不成立、半減期が長すぎる(1000h+)。
+
+### 20. カレンダー効果
+
+| パターン | Train | Test | 判定 |
+|---------|-------|------|------|
+| 月末効果 (28-31日) | -2.8〜-4.4bp | -2.6〜-5.1bp | 一致だが微弱 |
+| 月初効果 (1-3日) | -3.5〜+1.8bp | +1.6〜+3.0bp | 不安定 |
+| Hour 21 UTC (ETH) | +10.5bp (p=0.08) | +8.8bp (p=0.03) | 要Bonferroni |
+| Options Expiry | range 1.05-1.07x | - | 微小 |
+
+24時間 × 2トークン = 48検定 → Bonferroni補正で全て非有意。
+
+### 21. 条件付きMM (時間帯×ボラレジーム)
+
+全7パターン (all_hours, us_hours, us_weekday, ±vol_regime) でTest全てマイナス。
+SOL vol_adaptive: Train +12bp → Test -34bp (過適合の典型例)。
+
 ---
 
 ## 堅牢な正の知見
@@ -204,6 +240,10 @@ FR/OI閾値ベースのイベント分析。Train有意 → Test崩壊。
 8. **週末効果**: 週末range = 平日の63-78% — Train/Test完全一致
 9. **Volume→Range予測**: vol_ratio→next_range r=0.28-0.29 (Train/Test一致)
 10. **クロスアセット相関安定**: BTC-ETH r=0.82, BTC-SOL r=0.79 — ヘッジに有用
+11. **Vol変化のミーンリバージョン**: past_vol_chg→future_vol_chg r=-0.27〜-0.37 (Train/Test一致)
+12. **極端イベント・クラスタリング**: P(|z|>2 | prev>2)=3.1x, P(|z|>3 | prev>3)=5.2-6.3x
+13. **テール分布**: kurtosis=11.6-17.7 (fat tail), 1% VaR: BTC -148bp, ETH -222bp, SOL -246bp
+14. **ポジションサイジング効果**: Vol-adjusted MaxDD 55-68%削減、Extreme-aware DD 29-43%追加削減
 
 ---
 

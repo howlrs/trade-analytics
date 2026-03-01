@@ -3,9 +3,10 @@
 ## 調査サマリー
 
 ### 検証規模
-- **17手法** の方向性α探索 (OHLCV線形、デリバティブ、ML、オンチェーン、クロスセクショナル等)
+- **21手法** の方向性α探索 (OHLCV線形、デリバティブ、ML、オンチェーン、XS、Carry、ペア、カレンダー等)
 - **4通貨** × **複数ホライズン** × **Walk-Forward検証**
-- **MM戦略**: 戦場選定、Avellaneda-Stoikovモデル、逆選択、スプレッド捕獲
+- **MM戦略**: 戦場選定、Avellaneda-Stoikovモデル、逆選択、スプレッド捕獲、条件付きMM
+- **リスク管理**: 動的ポジションサイジング、テール分布分析、極端イベント検出
 - **統計的厳密性**: Newey-West HAC補正、重複排除、Bonferroni補正
 
 ### 大局的結論
@@ -54,6 +55,33 @@ position_size = target_risk / (rvol_24h × √(hold_hours/24))
 - ボラ圧縮 → ブレイクアウトではなく継続低ボラ
 - → レジーム判定後、数時間は同一レジームを前提に運用可能
 
+### 1.5 極端イベント・クラスタリング (NEW)
+| 閾値 | 無条件確率 | 条件付き確率 | 倍率 |
+|------|-----------|------------|------|
+| |z|>2 | 5.2-5.6% | 15.6-17.2% | **3.1x** |
+| |z|>3 | 1.5-1.9% | 9.4-11.4% | **5.2-6.3x** |
+
+→ 極端イベント後は次の極端イベント確率が3-6倍。即時スプレッド拡大/ポジション縮小が有効。
+
+### 1.6 Vol変化のミーンリバージョン (NEW)
+- past_vol_chg→future_vol_chg: r=-0.27〜-0.37 (Train/Test一致)
+- ボラスパイク後は正常化を見込める
+- ボラ圧縮後は「そのまま低ボラ」が最有力 (ブレイクアウトではない)
+
+### 1.7 動的ポジションサイジング効果 (NEW)
+| 比較 | MaxDD削減 | Sharpe改善 |
+|------|----------|-----------|
+| Vol-adjusted vs Equal | 55-68% | +0.5-0.9 |
+| Extreme-aware追加 | +29-43% | +0.2-0.3 |
+| Full model (vol+time+regime) | BTC: -1.88→-0.61 | ETH: -2.10→-1.19 |
+
+`src/risk.py` として実装済み (18テスト全通過)。
+
+### 1.8 テール分布 (NEW)
+- Excess Kurtosis: BTC=11.6, ETH=12.8, SOL=12.6, SUI=17.7 (正規分布=0)
+- 1% VaR: BTC -148bp, ETH -222bp, SOL -246bp, SUI -282bp
+- Rolling VaR (24h) のbreach率: 1.9-2.2% (目標1%を超過 → 保守的な係数設定が必要)
+
 ---
 
 ## Tier 2: 限定的に有望 (追加検証必要)
@@ -89,6 +117,12 @@ position_size = target_risk / (rvol_24h × √(hold_hours/24))
 | FR Settlement Timing | Train/Test符号反転 |
 | Cross-Exchange Lead-Lag | r=0.01-0.03 (無効) |
 | Volume Imbalance→Direction | r=0.01-0.06 (微弱) |
+| FR Carry (Simple) | FR収入(0.5-0.9bp) < コスト(8bp) |
+| Basis Carry | Train/Test符号反転 |
+| ペアトレード (ETH/BTC等) | コインテグレーション不成立、HL>1000h |
+| カレンダー効果 (月末/月初) | 微弱(3-5bp)、Bonferroni後非有意 |
+| 条件付きMM (時間帯×Vol) | 全7パターンでTest全てマイナス |
+| Post-Extreme Reversal | Train→Test符号反転 |
 
 ---
 
