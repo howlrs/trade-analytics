@@ -5,16 +5,20 @@
 ### parquet
 
 ```python
-import pandas as pd
+import polars as pl
 
 # 保存
-df.to_parquet('data/btc_ohlcv_1h.parquet', engine='pyarrow')
+df.write_parquet('data/btc_ohlcv_1h.parquet')
 
 # 読み込み
-df = pd.read_parquet('data/btc_ohlcv_1h.parquet')
+df = pl.read_parquet('data/btc_ohlcv_1h.parquet')
 
 # 特定カラムのみ読み込み（メモリ節約）
-df = pd.read_parquet('data/btc_ohlcv_1h.parquet', columns=['close', 'volume'])
+df = pl.read_parquet('data/btc_ohlcv_1h.parquet', columns=['close', 'volume'])
+
+# Lazy読み込み（大規模データに最適）
+lf = pl.scan_parquet('data/btc_ohlcv_1h.parquet')
+result = lf.filter(pl.col('close') > 50000).collect()
 ```
 
 利点: 型情報保持、圧縮による軽量化、カラムナ形式で高速読み込み
@@ -30,7 +34,7 @@ con = duckdb.connect('data/market.duckdb')
 df = con.execute("""
     SELECT * FROM read_parquet('data/btc_ohlcv_1h.parquet')
     WHERE timestamp >= '2026-01-01'
-""").fetchdf()
+""").pl()  # polars DataFrameとして取得
 
 # 複数parquetの結合
 df = con.execute("""
@@ -38,18 +42,18 @@ df = con.execute("""
     FROM read_parquet('data/btc_ohlcv_1h.parquet') a
     JOIN read_parquet('data/btc_funding.parquet') b
     ON a.timestamp = b.timestamp
-""").fetchdf()
+""").pl()
 ```
 
 ## ccxt によるOHLCV一括取得
 
 ```python
 import ccxt
-import pandas as pd
+import polars as pl
 import time
 
 def fetch_all_ohlcv(symbol, timeframe, since, exchange_id='binance'):
-    exchange = getattr(ccxt, exchange_id)()
+    exchange = getattr(ccxt, exchange_id)({'enableRateLimit': True})
     all_data = []
 
     while True:
@@ -57,41 +61,86 @@ def fetch_all_ohlcv(symbol, timeframe, since, exchange_id='binance'):
         if not ohlcv:
             break
         all_data.extend(ohlcv)
-        since = ohlcv[-1][0] + 1  # 次の開始時刻
+        since = ohlcv[-1][0] + 1
         time.sleep(exchange.rateLimit / 1000)
 
-    df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    return df
+    df = pl.DataFrame(
+        all_data,
+        schema=["timestamp", "open", "high", "low", "close", "volume"],
+        orient="row",
+    )
+    df = df.with_columns(
+        pl.from_epoch(pl.col("timestamp"), time_unit="ms").alias("timestamp")
+    )
+    return df.unique(subset=["timestamp"]).sort("timestamp")
 
 # 使用例
-df = fetch_all_ohlcv('BTC/USDT', '1h', exchange.parse8601('2026-01-01T00:00:00Z'))
-df.to_parquet('data/btc_usdt_1h.parquet')
+df = fetch_all_ohlcv('BTC/USDT:USDT', '1h', exchange.parse8601('2026-01-01T00:00:00Z'))
+df.write_parquet('data/btc_usdt_1h.parquet')
+```
+
+## Bybit REST API 直接取得（推奨）
+
+ccxtのBybit向けページネーションには問題があるため、Bybit v5 REST APIを直接使用する。
+
+```python
+import requests
+import polars as pl
+
+def fetch_bybit_ohlcv_rest(symbol_raw, interval, start_ms, end_ms):
+    pair = symbol_raw.split(":")[0].replace("/", "")
+    url = "https://api.bybit.com/v5/market/kline"
+    all_data = []
+    current_end = end_ms
+
+    while current_end > start_ms:
+        params = {
+            "category": "linear", "symbol": pair,
+            "interval": interval, "end": current_end, "limit": 1000,
+        }
+        resp = requests.get(url, params=params, timeout=30)
+        items = resp.json()["result"]["list"]
+        if not items:
+            break
+        # Bybitは降順で返すため、startTimeでフィルタ
+        batch = [r for r in items if int(r[0]) >= start_ms]
+        all_data.extend(batch)
+        current_end = int(items[-1][0]) - 1
+
+    # DataFrame変換
+    records = [{"timestamp": int(r[0]), "open": float(r[1]), "high": float(r[2]),
+                "low": float(r[3]), "close": float(r[4]), "volume": float(r[5])}
+               for r in all_data]
+    df = pl.DataFrame(records)
+    df = df.with_columns(
+        pl.from_epoch(pl.col("timestamp"), time_unit="ms").alias("timestamp")
+    )
+    return df.unique(subset=["timestamp"]).sort("timestamp")
 ```
 
 ## Funding Rate 履歴取得
 
 ```python
 def fetch_funding_history(symbol, exchange_id='binance'):
-    exchange = getattr(ccxt, exchange_id)({'options': {'defaultType': 'future'}})
-    history = exchange.fetch_funding_rate_history(
-        symbol,
-        params={"paginate": True, "paginationCalls": 10}
+    exchange = getattr(ccxt, exchange_id)({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'},
+    })
+    history = exchange.fetch_funding_rate_history(symbol, limit=1000)
+    records = [{"timestamp": r["timestamp"], "funding_rate": r["fundingRate"]}
+               for r in history]
+    df = pl.DataFrame(records)
+    df = df.with_columns(
+        pl.from_epoch(pl.col("timestamp"), time_unit="ms").alias("timestamp")
     )
-    df = pd.DataFrame(history)
-    df['datetime'] = pd.to_datetime(df['datetime'])
-    return df[['datetime', 'symbol', 'fundingRate', 'markPrice']]
-
-df_fr = fetch_funding_history('BTC/USDT:USDT')
-df_fr.to_parquet('data/btc_funding_rate.parquet')
+    return df.unique(subset=["timestamp"]).sort("timestamp")
 ```
 
 ## DefiLlama データ取得
 
 ```python
 import requests
-import pandas as pd
+import polars as pl
 
 BASE_URL = "https://api.llama.fi"
 
@@ -99,16 +148,10 @@ BASE_URL = "https://api.llama.fi"
 def fetch_protocol_tvl(protocol):
     resp = requests.get(f"{BASE_URL}/api/protocol/{protocol}")
     data = resp.json()
-    df = pd.DataFrame(data['tvl'])
-    df['date'] = pd.to_datetime(df['date'], unit='s')
-    return df
-
-# ステーブルコイン時価総額推移
-def fetch_stablecoin_mcap():
-    resp = requests.get(f"{BASE_URL}/stablecoins/stablecoincharts/all")
-    data = resp.json()
-    df = pd.DataFrame(data)
-    df['date'] = pd.to_datetime(df['date'], unit='s')
+    df = pl.DataFrame(data['tvl'])
+    df = df.with_columns(
+        pl.from_epoch(pl.col("date"), time_unit="s").alias("date")
+    )
     return df
 
 # DEXボリューム
@@ -117,56 +160,66 @@ def fetch_dex_volume():
     return resp.json()
 ```
 
-## テクニカル指標の計算
-
-### pandas-ta
+## テクニカル指標の計算（polars式ベース）
 
 ```python
-import pandas_ta as ta
+import polars as pl
 
-# 一括計算（Strategy）
-strategy = ta.Strategy(
-    name="basic",
-    ta=[
-        {"kind": "sma", "length": 20},
-        {"kind": "ema", "length": 12},
-        {"kind": "ema", "length": 26},
-        {"kind": "rsi", "length": 14},
-        {"kind": "macd", "fast": 12, "slow": 26, "signal": 9},
-        {"kind": "bbands", "length": 20, "std": 2},
-        {"kind": "adx", "length": 14},
-        {"kind": "obv"},
-        {"kind": "vwap"},
-    ]
+# SMA
+df = df.with_columns(
+    pl.col("close").rolling_mean(window_size=20).alias("sma_20")
 )
-df.ta.strategy(strategy)
+
+# EMA
+df = df.with_columns(
+    pl.col("close").ewm_mean(span=12).alias("ema_12"),
+    pl.col("close").ewm_mean(span=26).alias("ema_26"),
+)
+
+# RSI
+delta = pl.col("close").diff()
+gain = delta.clip(lower_bound=0).rolling_mean(window_size=14)
+loss = (-delta.clip(upper_bound=0)).rolling_mean(window_size=14)
+df = df.with_columns(
+    (100 - 100 / (1 + gain / loss)).alias("rsi_14")
+)
+
+# Bollinger Bands
+df = df.with_columns(
+    pl.col("close").rolling_mean(window_size=20).alias("bb_mid"),
+    (pl.col("close").rolling_mean(window_size=20)
+     + 2 * pl.col("close").rolling_std(window_size=20)).alias("bb_upper"),
+    (pl.col("close").rolling_mean(window_size=20)
+     - 2 * pl.col("close").rolling_std(window_size=20)).alias("bb_lower"),
+)
 ```
 
-### TA-Lib
+### TA-Lib（numpy配列経由）
 
 ```python
 import talib
+import numpy as np
 
-df['sma_20'] = talib.SMA(df['close'], timeperiod=20)
-df['rsi_14'] = talib.RSI(df['close'], timeperiod=14)
-macd, signal, hist = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
-
-# ローソク足パターン検出
-df['doji'] = talib.CDLDOJI(df['open'], df['high'], df['low'], df['close'])
-df['hammer'] = talib.CDLHAMMER(df['open'], df['high'], df['low'], df['close'])
-df['engulfing'] = talib.CDLENGULFING(df['open'], df['high'], df['low'], df['close'])
+close = df["close"].to_numpy()
+df = df.with_columns(
+    pl.Series("sma_20", talib.SMA(close, timeperiod=20)),
+    pl.Series("rsi_14", talib.RSI(close, timeperiod=14)),
+)
 ```
 
-## Jupyter notebook テンプレート
+## marimo notebook テンプレート
 
 分析ノートブックの典型的な構成:
 
 ```
 1. セットアップ（import、データ読み込み）
-2. データ概要確認（shape, dtypes, describe, 欠損値）
+2. データ概要確認（shape, dtypes, describe, null_count）
 3. 可視化（価格チャート、指標オーバーレイ）
 4. 分析（仮説検証、相関分析、条件フィルタリング）
 5. シグナル生成（エントリー/エグジット条件）
 6. バックテスト（簡易P&L計算）
 7. 結論・知見メモ
 ```
+
+marimo notebookは `.py` ファイルとして保存されるため、gitでの差分管理が容易。
+`marimo edit analysis_*.py` で起動する。

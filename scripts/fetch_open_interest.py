@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """Open Interest history fetcher for Binance and Bybit futures.
 
-Binance: /futures/data/openInterestHist (last 30 days only)
-Bybit: /v5/market/open-interest (cursor pagination, 1 year possible)
-
 Usage:
     python scripts/fetch_open_interest.py --exchange binance --symbol BTC/USDT:USDT
     python scripts/fetch_open_interest.py --exchange bybit --symbol ETH/USDT:USDT --start 2025-03-01
@@ -15,8 +12,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import ccxt
-import pandas as pd
+import polars as pl
 import requests
 
 logging.basicConfig(
@@ -44,8 +40,6 @@ def to_ms(date_str: str) -> int:
     return int(dt.timestamp() * 1000)
 
 
-# --- Binance: REST API direct (ccxt doesn't support OI history well) ---
-
 BINANCE_OI_INTERVAL_MAP = {
     "5m": "5m", "15m": "15m", "30m": "30m",
     "1h": "1h", "2h": "2h", "4h": "4h", "6h": "6h", "12h": "12h", "1d": "1d",
@@ -53,7 +47,6 @@ BINANCE_OI_INTERVAL_MAP = {
 
 
 def fetch_binance_oi(symbol_raw: str, interval: str, start_ms: int = None, end_ms: int = None) -> list:
-    # BTC/USDT:USDT -> BTCUSDT
     pair = symbol_raw.split(":")[0].replace("/", "")
     period = BINANCE_OI_INTERVAL_MAP.get(interval, "4h")
     url = "https://fapi.binance.com/futures/data/openInterestHist"
@@ -94,7 +87,7 @@ def fetch_binance_oi(symbol_raw: str, interval: str, start_ms: int = None, end_m
     return all_data
 
 
-def binance_oi_to_df(data: list) -> pd.DataFrame:
+def binance_oi_to_df(data: list) -> pl.DataFrame:
     records = []
     for r in data:
         records.append({
@@ -102,13 +95,13 @@ def binance_oi_to_df(data: list) -> pd.DataFrame:
             "open_interest": float(r["sumOpenInterest"]),
             "open_interest_value": float(r["sumOpenInterestValue"]),
         })
-    df = pd.DataFrame(records)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    df = pl.DataFrame(records)
+    df = df.with_columns(
+        pl.from_epoch(pl.col("timestamp"), time_unit="ms").alias("timestamp")
+    )
+    df = df.unique(subset=["timestamp"]).sort("timestamp")
     return df
 
-
-# --- Bybit: REST API direct (cursor pagination) ---
 
 BYBIT_OI_INTERVAL_MAP = {
     "5m": "5min", "15m": "15min", "30m": "30min",
@@ -170,16 +163,18 @@ def fetch_bybit_oi(symbol_raw: str, interval: str, start_ms: int = None, end_ms:
     return all_data
 
 
-def bybit_oi_to_df(data: list) -> pd.DataFrame:
+def bybit_oi_to_df(data: list) -> pl.DataFrame:
     records = []
     for r in data:
         records.append({
             "timestamp": int(r["timestamp"]),
             "open_interest": float(r["openInterest"]),
         })
-    df = pd.DataFrame(records)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    df = pl.DataFrame(records)
+    df = df.with_columns(
+        pl.from_epoch(pl.col("timestamp"), time_unit="ms").alias("timestamp")
+    )
+    df = df.unique(subset=["timestamp"]).sort("timestamp")
     return df
 
 
@@ -213,7 +208,7 @@ def main():
         df = bybit_oi_to_df(data)
 
     out = output_path(args.exchange, args.symbol, args.output)
-    df.to_parquet(out, engine="pyarrow", index=False)
+    df.write_parquet(out)
 
     logger.info(f"Saved {len(df)} records to {out}")
     logger.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")

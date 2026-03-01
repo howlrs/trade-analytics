@@ -20,13 +20,13 @@
 
 - ディレクトリ・ファイル: `YYYYMMDD_HHMM_<概要>` 形式（例: `20260301_0930_btc_funding_rate`）
 - 分析アイデア: `idea_*.md`
-- 分析ノートブック: `analysis_*.ipynb`
+- 分析ノートブック: `analysis_*.py`（marimo形式）
 
 ## データ形式
 
 - マーケットデータ: parquet形式で `data/` に保存
 - 大規模結合クエリ: DuckDB使用
-- 分析成果物: Jupyter notebook
+- 分析成果物: marimo notebook
 
 ## GitHub ワークフロー
 
@@ -65,7 +65,7 @@ Types: feat, fix, data, analysis, docs, refactor, test, chore
 1. アイデアを `idea_*.md` にまとめる
 2. 計画を `docs/plans/` に保存（Skillsを使用）
 3. データを取得・加工して `data/` に格納
-4. Jupyter notebook で分析実行
+4. marimo notebook で分析実行
 5. 結果レビュー
 6. 知見を `docs/knowledges/` に記録
 
@@ -79,9 +79,9 @@ Types: feat, fix, data, analysis, docs, refactor, test, chore
 
 ## 技術スタック
 
-- Python (pandas, numpy, jupyter)
+- Python (polars, numpy, marimo)
 - データ: parquet, DuckDB
-- 指標計算: pandas-ta, ta-lib
+- 指標計算: polars式ベース, ta-lib
 - 取引所API: ccxt
 - 取引所: Binance, Bybit
 - 対象通貨: BTC, ETH（USDT建て先物）
