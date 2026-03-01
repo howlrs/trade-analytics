@@ -3,7 +3,7 @@
 ## 調査サマリー
 
 ### 検証規模
-- **21手法** の方向性α探索 (OHLCV線形、デリバティブ、ML、オンチェーン、XS、Carry、ペア、カレンダー等)
+- **22手法** の方向性α探索 (OHLCV線形、デリバティブ、ML、オンチェーン、XS、Carry、ペア、カレンダー、FR Linear等)
 - **4通貨** × **複数ホライズン** × **Walk-Forward検証**
 - **MM戦略**: 戦場選定、Avellaneda-Stoikovモデル、逆選択、スプレッド捕獲、条件付きMM
 - **リスク管理**: 動的ポジションサイジング、テール分布分析、極端イベント検出
@@ -123,6 +123,8 @@ position_size = target_risk / (rvol_24h × √(hold_hours/24))
 | カレンダー効果 (月末/月初) | 微弱(3-5bp)、Bonferroni後非有意 |
 | 条件付きMM (時間帯×Vol) | 全7パターンでTest全てマイナス |
 | Post-Extreme Reversal | Train→Test符号反転 |
+| FR Level→7d fwd (Linear) | BTC Train/Test符号反転, WF全負 |
+| Cumulative FR (7d sum) | 全通貨p>0.42 |
 
 ---
 

@@ -9,6 +9,11 @@
 
 ---
 
+## 検証規模
+- **22手法** × 複数パラメータ × 複数ホライズン × 4通貨 = 数百の仮説検定
+- 全手法でTrain/Test分割 + Walk-Forward CV + 重複排除
+- Newey-West HAC, Bonferroni補正, Spearman順位相関を適用
+
 ## 検証した手法と結果
 
 ### 1. OHLCV 線形アルファ (#9)
@@ -223,6 +228,17 @@ FR/OI閾値ベースのイベント分析。Train有意 → Test崩壊。
 
 全7パターン (all_hours, us_hours, us_weekday, ±vol_regime) でTest全てマイナス。
 SOL vol_adaptive: Train +12bp → Test -34bp (過適合の典型例)。
+
+### 22. FR Level → 7d Forward (Linear, Non-overlapping)
+
+| トークン | Train r | Test r | WF mean | 判定 |
+|---------|---------|--------|---------|------|
+| BTC | -0.280 | +0.082 (p=0.70) | -81bp | FAIL (符号反転) |
+| ETH | -0.016 | -0.143 (p=0.49) | -61bp | FAIL |
+| SOL | -0.252 | -0.155 (p=0.46) | -77bp | FAIL |
+
+Cumulative FR (7d sum) も全て非有意 (p>0.42)。
+Spearman順位相関でもBTC Test r=0.025 (完全に無相関)。
 
 ---
 
