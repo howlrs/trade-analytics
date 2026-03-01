@@ -20,7 +20,7 @@
 │       ├── data/          # 分析固有のデータ
 │       ├── img/           # チャート・可視化画像
 │       ├── idea_*.md      # 分析アイデアメモ
-│       └── analysis_*.ipynb  # 分析ノートブック
+│       └── analysis_*.py     # marimo分析ノートブック
 ├── data/                  # マーケットデータ（parquet/duckdb）
 ├── docs/
 │   ├── base.md            # 本ファイル（基本方針）
@@ -86,7 +86,7 @@ Claude Code から Skills/MCP を通じて外部AIを呼び出せる。
 1. **アイデア出し** - 仮説・着眼点を `idea_*.md` にまとめる
 2. **計画立案** - Claude Code（またはCodex CLI）で分析計画を作成し `docs/plans/` に保存
 3. **データ準備** - 必要なマーケットデータを取得・加工して `data/` に格納
-4. **分析実行** - Jupyter notebook で分析を実行（Claude Codeが得意）
+4. **分析実行** - marimo notebook で分析を実行（Claude Codeが得意）
 5. **レビュー** - 結果を検証し、必要に応じて外部AIでレビュー
 6. **知見蓄積** - 得られた知見を `docs/knowledges/` に記録
 7. **戦略化** - 有望な分析結果を投資戦略・botに落とし込む

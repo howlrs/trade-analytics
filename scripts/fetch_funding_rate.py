@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import ccxt
-import pandas as pd
+import polars as pl
 import requests
 
 logging.basicConfig(
@@ -160,7 +160,7 @@ def fetch_bybit_funding_rates_rest(
     return all_data
 
 
-def to_dataframe(data: list) -> pd.DataFrame:
+def to_dataframe(data: list) -> pl.DataFrame:
     records = []
     for r in data:
         records.append({
@@ -170,10 +170,11 @@ def to_dataframe(data: list) -> pd.DataFrame:
             "mark_price": r.get("markPrice"),
         })
 
-    df = pd.DataFrame(records)
-    if "timestamp" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    df = pl.DataFrame(records)
+    df = df.with_columns(
+        pl.from_epoch(pl.col("timestamp"), time_unit="ms").alias("timestamp")
+    )
+    df = df.unique(subset=["timestamp"]).sort("timestamp")
     return df
 
 
@@ -205,7 +206,7 @@ def main():
 
     df = to_dataframe(data)
     out = output_path(args.exchange, args.symbol, args.output)
-    df.to_parquet(out, engine="pyarrow", index=False)
+    df.write_parquet(out)
 
     logger.info(f"Saved {len(df)} records to {out}")
     logger.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")

@@ -1,6 +1,6 @@
 """Tests for fetch_open_interest.py - uses live API with minimal requests."""
 
-import pandas as pd
+import polars as pl
 import pytest
 
 from scripts.fetch_open_interest import (
@@ -24,8 +24,6 @@ class TestOutputPath:
 
 
 class TestBinanceOI:
-    """Binance OI - limited to last 30 days."""
-
     @pytest.fixture(scope="class")
     def binance_oi(self):
         data = fetch_binance_oi("BTC/USDT:USDT", "1d")
@@ -40,15 +38,13 @@ class TestBinanceOI:
         assert "open_interest_value" in binance_oi.columns
 
     def test_no_duplicates(self, binance_oi):
-        assert binance_oi["timestamp"].is_unique
+        assert binance_oi["timestamp"].n_unique() == len(binance_oi)
 
     def test_oi_positive(self, binance_oi):
         assert (binance_oi["open_interest"] > 0).all()
 
 
 class TestBybitOI:
-    """Bybit OI - cursor pagination, limited fetch for testing."""
-
     @pytest.fixture(scope="class")
     def bybit_oi(self):
         start = to_ms("2026-02-01")
@@ -64,13 +60,13 @@ class TestBybitOI:
         assert "open_interest" in bybit_oi.columns
 
     def test_no_duplicates(self, bybit_oi):
-        assert bybit_oi["timestamp"].is_unique
+        assert bybit_oi["timestamp"].n_unique() == len(bybit_oi)
 
     def test_oi_positive(self, bybit_oi):
         assert (bybit_oi["open_interest"] > 0).all()
 
     def test_parquet_roundtrip(self, bybit_oi, tmp_path):
         path = tmp_path / "test_oi.parquet"
-        bybit_oi.to_parquet(path, engine="pyarrow", index=False)
-        loaded = pd.read_parquet(path)
+        bybit_oi.write_parquet(path)
+        loaded = pl.read_parquet(path)
         assert len(loaded) == len(bybit_oi)

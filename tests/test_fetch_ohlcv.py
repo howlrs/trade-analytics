@@ -1,11 +1,12 @@
 """Tests for fetch_ohlcv.py - uses live API with minimal requests."""
 
-import pandas as pd
+import polars as pl
 import pytest
 
 from scripts.fetch_ohlcv import (
     create_exchange,
     fetch_all_ohlcv,
+    fetch_bybit_ohlcv_rest,
     output_path,
     to_dataframe,
     to_ms,
@@ -61,27 +62,27 @@ class TestFetchAndTransform:
 
     @pytest.fixture(scope="class")
     def bybit_data(self):
-        ex = create_exchange("bybit")
         since = to_ms("2026-02-28")
         end = to_ms("2026-03-01")
-        data = fetch_all_ohlcv(ex, "BTC/USDT:USDT", "1h", since, end)
+        data = fetch_bybit_ohlcv_rest("BTC/USDT:USDT", "1h", since, end)
         return to_dataframe(data)
 
     def test_binance_record_count(self, binance_data):
         assert len(binance_data) == 24
 
     def test_binance_columns(self, binance_data):
-        assert list(binance_data.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+        assert binance_data.columns == ["timestamp", "open", "high", "low", "close", "volume"]
 
     def test_binance_no_duplicates(self, binance_data):
-        assert binance_data["timestamp"].is_unique
+        assert binance_data["timestamp"].n_unique() == len(binance_data)
 
     def test_binance_sorted(self, binance_data):
-        assert binance_data["timestamp"].is_monotonic_increasing
+        ts = binance_data["timestamp"].cast(pl.Int64)
+        assert (ts.diff().drop_nulls() > 0).all()
 
     def test_binance_dtypes(self, binance_data):
-        assert pd.api.types.is_datetime64_any_dtype(binance_data["timestamp"])
-        assert pd.api.types.is_float_dtype(binance_data["close"])
+        assert binance_data["timestamp"].dtype == pl.Datetime("ms")
+        assert binance_data["close"].dtype == pl.Float64
 
     def test_binance_values_reasonable(self, binance_data):
         assert (binance_data["high"] >= binance_data["low"]).all()
@@ -91,17 +92,17 @@ class TestFetchAndTransform:
         assert len(bybit_data) == 24
 
     def test_bybit_columns(self, bybit_data):
-        assert list(bybit_data.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+        assert bybit_data.columns == ["timestamp", "open", "high", "low", "close", "volume"]
 
     def test_bybit_no_duplicates(self, bybit_data):
-        assert bybit_data["timestamp"].is_unique
+        assert bybit_data["timestamp"].n_unique() == len(bybit_data)
 
     def test_bybit_values_reasonable(self, bybit_data):
         assert (bybit_data["high"] >= bybit_data["low"]).all()
 
     def test_parquet_roundtrip(self, binance_data, tmp_path):
         path = tmp_path / "test.parquet"
-        binance_data.to_parquet(path, engine="pyarrow", index=False)
-        loaded = pd.read_parquet(path)
+        binance_data.write_parquet(path)
+        loaded = pl.read_parquet(path)
         assert len(loaded) == len(binance_data)
-        assert list(loaded.columns) == list(binance_data.columns)
+        assert loaded.columns == binance_data.columns

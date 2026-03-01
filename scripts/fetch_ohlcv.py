@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import ccxt
-import pandas as pd
+import polars as pl
 import requests
 
 logging.basicConfig(
@@ -119,12 +119,10 @@ def fetch_bybit_ohlcv_rest(
     """Fetch OHLCV directly from Bybit v5 REST API (handles descending order)."""
     pair = symbol_raw.split(":")[0].replace("/", "")
     interval = BYBIT_INTERVAL_MAP.get(timeframe, "60")
-    interval_ms = INTERVAL_MS.get(timeframe, 3_600_000)
     url = "https://api.bybit.com/v5/market/kline"
     all_data = []
     limit = 1000
 
-    # Bybit returns data newest-first, so we iterate with end sliding backward
     current_end = end_ms
 
     while current_end > since_ms:
@@ -154,7 +152,6 @@ def fetch_bybit_ohlcv_rest(
         if not items:
             break
 
-        # Convert to standard format [timestamp, open, high, low, close, volume]
         batch = []
         for item in items:
             ts = int(item[0])
@@ -171,7 +168,6 @@ def fetch_bybit_ohlcv_rest(
             f"Fetched {len(batch)} candles, oldest: {datetime.fromtimestamp(oldest_ts/1000, tz=timezone.utc).isoformat()}"
         )
 
-        # Move end back to just before the oldest item
         current_end = oldest_ts - 1
 
         if len(items) < limit:
@@ -183,10 +179,16 @@ def fetch_bybit_ohlcv_rest(
     return all_data
 
 
-def to_dataframe(data: list) -> pd.DataFrame:
-    df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+def to_dataframe(data: list) -> pl.DataFrame:
+    df = pl.DataFrame(
+        data,
+        schema=["timestamp", "open", "high", "low", "close", "volume"],
+        orient="row",
+    )
+    df = df.with_columns(
+        pl.from_epoch(pl.col("timestamp"), time_unit="ms").alias("timestamp")
+    )
+    df = df.unique(subset=["timestamp"]).sort("timestamp")
     return df
 
 
@@ -218,7 +220,7 @@ def main():
 
     df = to_dataframe(data)
     out = output_path(args.exchange, args.symbol, args.timeframe, args.output)
-    df.to_parquet(out, engine="pyarrow", index=False)
+    df.write_parquet(out)
 
     logger.info(f"Saved {len(df)} records to {out}")
     logger.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
