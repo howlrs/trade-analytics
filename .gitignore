@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (large files)
+data/*.parquet
+data/*.duckdb
+data/*.csv
+data/*.db
+
+# Environment & secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.json
+config.local.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude sessions (may contain sensitive context)
+docs/sessions/
