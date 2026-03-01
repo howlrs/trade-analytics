@@ -26,7 +26,7 @@
 
 - マーケットデータ: parquet形式で `data/` に保存
 - 大規模結合クエリ: DuckDB使用
-- 分析成果物: marimo notebook
+- 分析成果物: marimo notebook（作成ルールは `docs/knowledges/marimo_notebook.md` 参照）
 
 ## GitHub ワークフロー
 
