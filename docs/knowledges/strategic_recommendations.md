@@ -120,26 +120,28 @@ position_size = target_risk / (rvol_24h × √(hold_hours/24))
 
 **推奨**: データ蓄積 (あと6ヶ月) で再検証。現時点では実弾投入不可。
 
-### 2.2 MM戦場選定 (1m足分析追加)
+### 2.2 MM戦場選定 (CEX + DEX統合, NEW)
 
-**最終結論 (1h + 1m統合)**:
+**CEX結論**: 標準手数料(2bp maker)では全通貨マイナス。VIP5+(0bp)が必要だが到達困難。
 
-| 順位 | 通貨 | 取引所 | 根拠 |
-|------|------|--------|------|
-| **1** | **SOL** | **Binance** | Roll最小(3.0bp), フィル率最高(67.6%@10bp), 損益分岐に最も近い(0bp fee) |
-| 2 | ETH | Binance | 流動性最大, 出来高安定, Roll=4.3bp |
-| 3 | BTC | Binance | スプレッドタイトだがフィル率低(41.2%@10bp) |
+**DEX結論 — Drift Protocol が最有力**:
 
-**MM損益分岐手数料** (AS inventory model, k=1.5):
-| 通貨 | Train (0bp fee) | Test (0bp fee) | Train/Test一致 |
-|------|----------------|----------------|--------------|
-| SOL | -190bp/day | +10bp/day | ❌ 符号反転 |
-| ETH | -222bp/day | -138bp/day | ✅ 両方マイナス |
-| BTC | -264bp/day | -87bp/day | ✅ 両方マイナス |
+| 順位 | 通貨 | 取引所 | Maker Fee | Quoted Spread | 根拠 |
+|------|------|--------|-----------|-------------|------|
+| **1** | **SOL** | **Drift** | **-0.25bp** | **10bp (vAMM)** | 即時rebate, 競争なし, 監査済み |
+| 2 | ETH | Drift | -0.25bp | 15bp (vAMM) | 出来高やや低 |
+| 3 | SOL | Hyperliquid | 1.5bp (VIP0) | 0.12bp | VIP4で0bp, 競争激, 未監査 |
+| 4 | SOL | Binance | 2bp (VIP0) | 1.2bp | VIP5で0bp, 到達困難 |
 
-→ **標準手数料(2bp maker)では全通貨マイナス。ゼロ手数料でもSOL以外はマイナス。**
-→ **SOLの損益分岐はTest期間の高ボラに依存（Train/Test不一致）。堅牢ではない。**
-→ **Tick/LOBデータでの再検証が必須。**
+**Drift SOL-PERP の優位性**:
+- Maker rebate -0.25bp (即時、volume要件なし)
+- vAMMスプレッド ~10bp → 5bp以内に quote すれば独占的にフィルされる
+- dlobに実limit orderがほぼ存在しない → first mover advantage
+- DriftPy SDK (Python) → 既存パイプラインに統合可能
+- Trail of Bits + Neodyme 監査済み
+
+**リスク**: 逆選択(CEX-DEX arb)、Solana障害、capture rate不確実性
+**次のステップ**: DriftPy接続、paper trading、逆選択実測定 (2週間)
 
 ---
 
@@ -188,45 +190,46 @@ position_size = target_risk / (rvol_24h × √(hold_hours/24))
    - ボラレジーム変化アラート (rvol_24h が 48h MA の 1.5σ超)
    - クロスアセット相関崩壊アラート (7d rolling corr < 0.6)
 
-### Phase 2: Tick/LOBデータ取得 (必須, 次のステップ)
-1. **WebSocket BBO + Trade stream**
-   - Binance USDT-M Futures: `wss://fstream.binance.com/ws/<symbol>@bookTicker`
-   - Bybit: `wss://stream.bybit.com/v5/public/linear`
-   - SOL, ETH, BTC の3通貨
-   - 最低2週間のTick蓄積
+### Phase 2: Drift Protocol MM構築 (最優先, 次のステップ)
 
-2. **LOBデータで検証すべき項目**
-   - 実quoted spread vs Roll推定(3-5bp) の比較
-   - Queue position と実フィル確率
-   - 逆選択の trade-by-trade 測定
-   - BBO imbalance → short-term direction の予測力
-   - Trade flow toxicity (VPIN等)
+1. **DriftPy SDK統合** (1-2日)
+   - `pip install driftpy`
+   - Testnet接続、paper trading環境構築
+   - WebSocket で Drift L2 order book リアルタイム取得
+   - 最低2週間のtrade-by-tradeデータ蓄積
 
-3. **清算データ**
-   - Coinglass API (要キー取得)
-   - 大口清算イベントの事前検知
+2. **CEX参照価格パイプライン** (1日)
+   - Binance WS BBO stream → reference price
+   - Drift mid vs Binance mid のリアルタイム乖離モニタリング
+   - 逆選択の実測定 (CEX move → Drift fill の時間差・価格差)
 
-### Phase 3: Tick-Level MM再検証 (LOBデータ取得後)
-1. **マイクロストラクチャー分析**
-   - Bid-Ask Bounce (実BBO)
-   - Trade Imbalance (buy/sell volume)
-   - LOB圧力指標 (bid/ask depth ratio)
-   - 逆選択の正確な測定 (trade sign + price impact)
+3. **最小構成MM (MVP)** (1週間)
+   - SOL-PERP のみ
+   - Capital: $10-50K
+   - Half-spread: 3-5bp (vAMM内側)
+   - Post-Only order → maker rebate確保
+   - Binance/Bybit でデルタヘッジ (ccxt)
+   - `src/risk.py` の動的サイジング適用
+   - 自動停止条件: スプレッド異常、inventory超過、Solana障害
 
-2. **ASモデル再実装**
-   - Tick粒度でのスプレッド・在庫最適化
-   - 時間帯・ボラレジーム条件付きパラメータ
-   - 実フィル確率に基づくバックテスト
+4. **評価指標**
+   - Spread capture rate (both-fill / total-fill)
+   - Adverse selection (fill price vs 5m後の mid)
+   - Net PnL after fees & hedging cost
+   - Inventory turnover (daily)
+   - Sharpe ratio (daily returns)
 
-3. **ペーパートレード**
-   - 実BBO でのMMシミュレーション
-   - フィル確率の正確な推定
-   - Binance Testnet での検証
+### Phase 3: スケール拡大 (Phase 2検証後)
 
-### Phase 4: VIP手数料交渉 (Phase 3と並行)
-- MM損益分岐には0bp以下のmaker手数料が必要
-- Binance/Bybit の MM プログラム申請
-- 必要条件: 月間取引量、稼働率、スプレッド維持
+1. **通貨拡大**: ETH-PERP, BTC-PERP
+2. **資本拡大**: $50K → $200K (リスク管理と並行)
+3. **CEX MM並行**: Drift実績を基にBinance/Bybit MMプログラム申請
+4. **Hyperliquid展開**: maker rebate program到達後
+
+### Phase 4: Tick/LOBデータ (CEX MM検討時)
+- Binance WS BBO + Trade → CEX microstructure分析
+- Drift vs CEX の逆選択比較
+- VIP手数料交渉の材料整備
 
 ---
 
