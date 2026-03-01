@@ -14,6 +14,7 @@ from pathlib import Path
 
 import ccxt
 import pandas as pd
+import requests
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +55,7 @@ def fetch_all_funding_rates(
     since_ms: int,
     end_ms: int,
 ) -> list:
+    """Fetch Funding Rate history using ccxt (works well for Binance)."""
     all_data = []
     current_since = since_ms
 
@@ -74,7 +76,6 @@ def fetch_all_funding_rates(
             logger.info("No more data returned, stopping.")
             break
 
-        # Filter out data beyond end_ms
         rates = [r for r in rates if r["timestamp"] < end_ms]
         if not rates:
             break
@@ -93,21 +94,86 @@ def fetch_all_funding_rates(
     return all_data
 
 
+def fetch_bybit_funding_rates_rest(
+    symbol_raw: str,
+    since_ms: int,
+    end_ms: int,
+) -> list:
+    """Fetch Funding Rate directly from Bybit v5 REST API (backward pagination)."""
+    pair = symbol_raw.split(":")[0].replace("/", "")
+    url = "https://api.bybit.com/v5/market/funding/history"
+    all_data = []
+    limit = 200
+    current_end = end_ms
+
+    while current_end > since_ms:
+        params = {
+            "category": "linear",
+            "symbol": pair,
+            "endTime": current_end,
+            "limit": limit,
+        }
+
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            result = resp.json()
+        except Exception as e:
+            logger.warning(f"Request error, retrying in 5s: {e}")
+            time.sleep(5)
+            continue
+
+        if result.get("retCode") != 0:
+            logger.error(f"Bybit API error: {result.get('retMsg')}")
+            break
+
+        items = result.get("result", {}).get("list", [])
+        if not items:
+            break
+
+        batch = []
+        for item in items:
+            ts = int(item["fundingRateTimestamp"])
+            if since_ms <= ts < end_ms:
+                batch.append({
+                    "timestamp": ts,
+                    "symbol": item.get("symbol"),
+                    "fundingRate": float(item["fundingRate"]),
+                    "markPrice": None,
+                })
+
+        if batch:
+            all_data.extend(batch)
+            oldest_ts = min(b["timestamp"] for b in batch)
+            logger.info(
+                f"Fetched {len(batch)} records, oldest: {datetime.fromtimestamp(oldest_ts/1000, tz=timezone.utc).isoformat()}"
+            )
+            current_end = oldest_ts - 1
+        else:
+            break
+
+        if len(items) < limit:
+            break
+
+        time.sleep(0.3)
+
+    return all_data
+
+
 def to_dataframe(data: list) -> pd.DataFrame:
     records = []
     for r in data:
         records.append({
-            "timestamp": r["timestamp"],
-            "datetime": r.get("datetime"),
+            "timestamp": r["timestamp"] if isinstance(r["timestamp"], int) else r["timestamp"],
             "symbol": r.get("symbol"),
             "funding_rate": r.get("fundingRate"),
             "mark_price": r.get("markPrice"),
         })
 
     df = pd.DataFrame(records)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    if "timestamp" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    df = df.drop(columns=["datetime"], errors="ignore")
     return df
 
 
@@ -122,13 +188,16 @@ def output_path(exchange_id: str, symbol: str, custom_path: str = None) -> Path:
 def main():
     args = parse_args()
 
-    exchange = create_exchange(args.exchange)
     since_ms = to_ms(args.start)
     end_ms = to_ms(args.end) if args.end else int(datetime.now(timezone.utc).timestamp() * 1000)
 
     logger.info(f"Fetching funding rates for {args.symbol} from {args.exchange} ({args.start} to {args.end or 'now'})")
 
-    data = fetch_all_funding_rates(exchange, args.symbol, since_ms, end_ms)
+    if args.exchange == "bybit":
+        data = fetch_bybit_funding_rates_rest(args.symbol, since_ms, end_ms)
+    else:
+        exchange = create_exchange(args.exchange)
+        data = fetch_all_funding_rates(exchange, args.symbol, since_ms, end_ms)
 
     if not data:
         logger.warning("No data fetched.")
