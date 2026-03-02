@@ -1,4 +1,6 @@
 import type { PoolInfo, PositionInfo, RebalanceDecision, TriggerType } from '../types/index.js'
+import type { RegimeState } from './regime.js'
+import { getCooldownMultiplier } from './regime.js'
 import { tickToPrice, getCurrentPrice } from '../core/price.js'
 import { getLogger } from '../utils/logger.js'
 import { loadDailyRebalanceCounts, saveDailyRebalanceCount } from '../utils/state.js'
@@ -91,6 +93,8 @@ export interface TriggerParams {
   fallbackDailyVolumeRatio?: number
   /** Maximum breakeven hours for profitability gate (default: 48) */
   maxBreakevenHours?: number
+  /** Current regime state from regime detection module */
+  regimeState?: RegimeState
 }
 
 /**
@@ -291,15 +295,19 @@ export function evaluateRebalanceTrigger(
     // Select cooldown based on current or last-known direction
     // SUI下落 = pool tick上昇 = position is SUI heavy → long cooldown (60min)
     // SUI上昇 = pool tick下降 = position is USDC heavy → short cooldown (30min)
-    let cooldownSec: number
+    let baseCooldownSec: number
     let cooldownReason: string
     if (isBelow || lastDirection === 'down') {
-      cooldownSec = COOLDOWN_DOWN_SEC
+      baseCooldownSec = COOLDOWN_DOWN_SEC
       cooldownReason = 'SUI上昇 (short cooldown, re-enter quickly)'
     } else {
-      cooldownSec = COOLDOWN_UP_SEC
+      baseCooldownSec = COOLDOWN_UP_SEC
       cooldownReason = 'SUI下落 (long cooldown, waiting for rebound)'
     }
+
+    // Apply regime-based cooldown multiplier
+    const regimeCooldownMul = params.regimeState ? getCooldownMultiplier(params.regimeState) : 1.0
+    const cooldownSec = Math.round(baseCooldownSec * regimeCooldownMul)
 
     if (elapsedSec < cooldownSec) {
       // Cooldown: prevents consecutive rebalances from being triggered too quickly.
@@ -391,7 +399,9 @@ export function evaluateRebalanceTrigger(
     log.warn('Price out of range', { currentPrice, lowerPrice, upperPrice, direction })
 
     // Range-out wait: delay rebalance to allow price self-correction
-    const waitSec = params.waitAfterRangeoutSec ?? 1800
+    // During regime transition, double the wait to avoid whipsaw
+    const baseWaitSec = params.waitAfterRangeoutSec ?? 1800
+    const waitSec = (params.regimeState?.isTransition) ? baseWaitSec * 2 : baseWaitSec
     if (waitSec > 0) {
       const detectedAt = rangeOutDetectedAt.get(position.positionId)
       if (detectedAt == null) {

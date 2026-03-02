@@ -1,5 +1,6 @@
 import type { PoolInfo, PositionInfo, RebalanceDecision, TransactionResult } from '../types/index.js'
 import type { Config, PoolConfig } from '../types/config.js'
+import type { RegimeState } from '../strategy/regime.js'
 import { evaluateRebalanceTrigger, recordRebalanceForDay, transferDailyState } from '../strategy/trigger.js'
 import { calculateOptimalRange } from '../strategy/range.js'
 import { calculateVolatilityBasedTicks } from '../strategy/volatility.js'
@@ -323,6 +324,7 @@ export interface GuardrailContext {
   positionOpenedAt?: number
   optimalTickWidth?: number
   volStabilityCount?: number
+  regimeState?: RegimeState
 }
 
 export async function checkAndRebalance(
@@ -353,6 +355,7 @@ export async function checkAndRebalance(
     volStabilityCount: guardrailContext?.volStabilityCount,
     fallbackDailyVolumeRatio: config.fallbackDailyVolumeRatio,
     maxBreakevenHours: config.maxBreakevenHours,
+    regimeState: guardrailContext?.regimeState,
   })
 
   log.info('Rebalance evaluation', {
@@ -461,7 +464,7 @@ export async function checkAndRebalance(
   }
 
   // Calculate new optimal range
-  const newRange = calculateOptimalRange(pool, poolConfig, DECIMALS_A, DECIMALS_B, volatilityTickWidth)
+  const newRange = calculateOptimalRange(pool, poolConfig, DECIMALS_A, DECIMALS_B, volatilityTickWidth, guardrailContext?.regimeState)
   decision.newLower = newRange.priceLower
   decision.newUpper = newRange.priceUpper
 

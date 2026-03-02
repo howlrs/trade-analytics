@@ -9,6 +9,11 @@ export const PoolConfigSchema = z.object({
   volLookbackHours: z.number().min(0.5).max(24).default(2),
   volTickWidthMin: z.number().int().min(60).default(480),
   volTickWidthMax: z.number().int().min(60).default(1200),
+  volScalingMode: z.enum(['tiered', 'continuous']).default('continuous'),
+  sigmaLow: z.number().min(1).max(200).default(40),
+  sigmaHigh: z.number().min(1).max(500).default(120),
+  regimeEnabled: z.boolean().default(true),
+  binanceVolFallback: z.boolean().default(false),
 })
 
 export const ConfigSchema = z.object({
