@@ -146,17 +146,94 @@ capture rate次第では損益分岐に近づく可能性がある。
 ### 即座に実装すべき（3年確認済み）
 
 1. **Vol-of-Vol フィルター**: High Vol + Low VoV 時のみMM稼働
+   - ETHではSharpe +0.20改善。SOLではHV-HVV が paradoxically profitable のため要注意
 2. **下方Vol contagion 即時リスク制限**: BTC下落vol spike → 全通貨のリスク縮小
 3. **Driftクオート**: vol連動スプレッド、19:00-22:00 UTC集中稼働
 4. **SOL GARCH surprise後のポジション**: +2σ surprise → 24h方向ポジション (+63bp期待)
+5. **Volume Surprise シグナル** (OOS検証済み、Bonferroni通過): 詳細は下記7章
 
 ### 追加検証が必要
 
-1. **Volume Surprise → Forward Returns**: OOS検証、コスト後の実効性
-2. **低Vol時クロスアセットGranger**: 実行可能性（1h遅れは十分か）
-3. **Drift capture rate**: ペーパートレードで実測
+1. **低Vol時クロスアセットGranger**: 実行可能性（1h遅れは十分か）
+2. **Drift capture rate**: ペーパートレードで実測
 
 ### 棄却（3年データで再確認）
 
 - CEX MM（全条件マイナス）
 - 方向性α全般（1年結論を3年が支持）
+
+## 7. Volume Surprise シグナル（OOS検証済み）
+
+**プロジェクト初の確認済みトレーダブルシグナル。**
+
+### Walk-Forward OOS 結果
+
+| 通貨 | Hold | Q5 Mean (bp) | t-stat | Bonferroni |
+|------|------|-------------|--------|------------|
+| BTC | 4h | +7.52 | 3.93 | ✅ 通過 |
+| BTC | 8h | +14.37 | 5.58 | ✅ 通過 |
+| ETH | 8h | +17.19 | 5.26 | ✅ 通過 |
+| SOL | 4h | +10.99 | 3.19 | ✅ 通過 |
+| SOL | 8h | +24.95 | 5.39 | ✅ 通過 |
+
+### クロスアセット予測（最強シグナル）
+
+BTC vol Q5 → SOL 8h forward: **+31.57bp (t=7.23)**
+ETH vol Q5 → SOL 8h forward: **+31.53bp (t=7.53)**
+
+クロスアセットの方がwithin-assetより強い → BTC/ETH volume spike → SOL long が最適戦略。
+
+### 条件
+
+1. **高Vol時のみ有効**: 低Vol時は ~0bp（シグナルなし）
+2. **Hold period**: 1hは無効、4h以上が必要
+3. **Q5のみ**: 中間quintileは uninformative
+4. **2bp taker cost後も profitable**: SOL 8h net +22.95bp
+
+### 推奨実装
+
+```
+IF rvol_24h > trailing_90d_median:
+  IF btc_volume_zscore > Q5_threshold (or eth_volume_zscore > Q5):
+    LONG SOL, hold 4-8h
+```
+
+## 8. Drift マイクロ構造分析
+
+### Drift vs Binance 構造比較
+
+| 特性 | Binance | Drift | 含意 |
+|------|---------|-------|------|
+| Trending割合 | 20% | 39% | Drift は方向性が出やすい |
+| Trending持続時間 | 2.8h | 5.1h | Drift のトレンドは長い |
+| 効率性比率 (ER) | 1.085 | 0.975 | Drift はジャンプ多い |
+| ER>1 (smooth) 比率 | 85.8% | 32.2% | Drift の2/3はgappy |
+
+**含意**: Drift MM は Binance 比で広いベーススプレッドが必要。ER < 1 の環境ではadverse selectionが構造的に高い。
+
+### ER のトレンド（改善中）
+
+| 年 | Drift-Binance ER差 |
+|----|-------------------|
+| 2023 | -0.19 |
+| 2024 | -0.12 |
+| 2025 | -0.08 |
+| 2026 | -0.05 |
+
+→ Drift のマイクロ構造は年々改善。将来的にはBinance並みのER に収束する可能性。
+
+### 最適リバランス頻度
+
+| ラグ | Vol情報量 (R²) | 推奨 |
+|------|--------------|------|
+| 1h | 0.97 | 高頻度アップデート |
+| 8h | 0.74 | 有意義 |
+| 24h | 0.25 | 最低限のアップデート間隔 |
+| 48h | 0.12 | 限界以下 |
+
+**推奨: Volパラメータは最低24h毎に更新。理想は1-8h毎。**
+
+### レジーム遷移の予測可能性
+
+**不可能。** 遷移は急激で、事前兆候がない（delta_z が負 = 遷移直前にむしろ安定方向）。
+→ レジームの「検出」は即座に可能だが「予測」は不可。反応速度が重要。
