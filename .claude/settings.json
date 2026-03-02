@@ -1,0 +1,29 @@
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(sui client *)",
+      "Bash(sui keytool *)",
+      "Bash(suiup *)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(npx tsc *)",
+      "Bash(npx tsx *)",
+      "Bash(node *)",
+      "Bash(GCE_PASSPHRASE=$(grep GCE_PASSPHRASE .env | cut -d= -f2) bash *)",
+      "Bash(GCE_PASSPHRASE=* bash deploy/logs.sh *)",
+      "Bash(gcloud compute ssh *)",
+      "Bash(cat * | gemini -p *)",
+      "Bash(gemini -p *)"
+    ],
+    "deny": [
+      "Bash(sui client publish *)",
+      "Bash(sui client call *)",
+      "Bash(sui client transfer *)",
+      "Bash(sui client pay *)",
+      "Bash(rm -rf *)"
+    ]
+  }
+}
