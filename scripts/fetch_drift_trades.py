@@ -25,12 +25,19 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
-DLOB_BASE_URL = "https://dlob.drift.trade"
+DATA_API_BASE_URL = "https://data.api.drift.trade"
 
+# Legacy DLOB mapping (kept for reference)
 DRIFT_MARKET_INDEX = {
     "SOL": 0,
     "BTC": 1,
     "ETH": 2,
+}
+
+DRIFT_MARKET_SYMBOL = {
+    "SOL": "SOL-PERP",
+    "BTC": "BTC-PERP",
+    "ETH": "ETH-PERP",
 }
 
 
@@ -49,52 +56,68 @@ def parse_args():
 
 
 def fetch_trades(market: str, limit: int = 1000, max_retries: int = 3) -> list[dict]:
-    """Fetch recent trades from DLOB REST API."""
-    market_index = DRIFT_MARKET_INDEX.get(market)
-    if market_index is None:
+    """Fetch recent trades from Drift Data API.
+
+    Paginates automatically since API returns max 50 records per request.
+    """
+    symbol = DRIFT_MARKET_SYMBOL.get(market)
+    if symbol is None:
         logger.error(f"Unknown market: {market}")
         return []
 
-    url = f"{DLOB_BASE_URL}/trades"
-    params = {
-        "marketType": "perp",
-        "marketIndex": market_index,
-        "limit": limit,
-    }
+    all_records: list[dict] = []
+    page: str | None = None
+    page_size = min(limit, 50)  # API max is 50
 
-    retries = 0
-    while retries < max_retries:
-        try:
-            resp = requests.get(url, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list):
-                return data
-            # Some endpoints wrap in {"trades": [...]}
-            if isinstance(data, dict) and "trades" in data:
-                return data["trades"]
-            logger.warning(f"Unexpected response format for {market}: {type(data)}")
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            retries += 1
-            if retries >= max_retries:
-                logger.error(f"Failed after {max_retries} retries ({market}): {e}")
-                return []
-            logger.warning(f"Request error, retrying in 2s ({retries}/{max_retries}): {e}")
-            time.sleep(2)
+    while len(all_records) < limit:
+        url = f"{DATA_API_BASE_URL}/market/{symbol}/trades"
+        params: dict = {"limit": page_size}
+        if page is not None:
+            params["page"] = page
 
-    return []
+        retries = 0
+        data = None
+        while retries < max_retries:
+            try:
+                resp = requests.get(url, params=params, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as e:
+                retries += 1
+                if retries >= max_retries:
+                    logger.error(f"Failed after {max_retries} retries ({market}): {e}")
+                    return all_records
+                logger.warning(f"Request error, retrying in 2s ({retries}/{max_retries}): {e}")
+                time.sleep(2)
+
+        if data is None or not data.get("success"):
+            break
+
+        records = data.get("records", [])
+        if not records:
+            break
+
+        all_records.extend(records)
+        next_page = data.get("meta", {}).get("nextPage")
+        if next_page is None:
+            break
+        page = next_page
+
+    return all_records[:limit]
 
 
 def trades_to_dataframe(trades: list[dict], market: str) -> pl.DataFrame:
-    """Convert raw trade records to a polars DataFrame."""
+    """Convert raw trade records to a polars DataFrame.
+
+    Handles both Data API format (human-readable strings) and legacy DLOB format.
+    """
     if not trades:
         return pl.DataFrame()
 
     rows = []
     for t in trades:
         try:
-            # DLOB trades API response fields vary; handle common formats
             ts_raw = t.get("ts") or t.get("timestamp") or t.get("fillerRewardTs")
             if ts_raw is None:
                 continue
@@ -106,18 +129,23 @@ def trades_to_dataframe(trades: list[dict], market: str) -> pl.DataFrame:
             else:
                 ts = datetime.fromtimestamp(ts_val / 1000, tz=timezone.utc)
 
-            price = float(t.get("price", t.get("oraclePrice", 0)))
-            size = float(t.get("baseAssetAmountFilled", t.get("size", t.get("baseAssetAmount", 0))))
+            # Data API returns pre-formatted strings like "84.560990", "32.470000000"
+            price_raw = t.get("oraclePrice", t.get("price", "0"))
+            price = float(price_raw)
+            size_raw = t.get("baseAssetAmountFilled", t.get("size", t.get("baseAssetAmount", "0")))
+            size = float(size_raw)
 
-            # Normalize size (Drift uses 1e9 precision for base asset)
+            # Legacy DLOB format uses raw integers (1e9 base, 1e6 price)
             if size > 1e6:
                 size = size / 1e9
-
-            # Normalize price (Drift uses 1e6 precision)
             if price > 1e6 and market == "SOL":
                 price = price / 1e6
             elif price > 1e8:
                 price = price / 1e6
+
+            quote_filled = float(t.get("quoteAssetAmountFilled", 0))
+            taker_fee = float(t.get("takerFee", 0))
+            maker_rebate = float(t.get("makerRebate", 0))
 
             side = t.get("takerOrderDirection", t.get("side", "unknown"))
             if side == "long":
@@ -129,8 +157,12 @@ def trades_to_dataframe(trades: list[dict], market: str) -> pl.DataFrame:
                 "timestamp": ts,
                 "price": price,
                 "size": abs(size),
+                "quote_filled": quote_filled,
+                "taker_fee": taker_fee,
+                "maker_rebate": maker_rebate,
                 "side": side,
                 "market": market,
+                "action_explanation": t.get("actionExplanation", ""),
                 "tx_sig": t.get("txSig", t.get("txSignature", "")),
             })
         except (ValueError, TypeError) as e:
@@ -144,8 +176,12 @@ def trades_to_dataframe(trades: list[dict], market: str) -> pl.DataFrame:
         "timestamp": pl.Datetime("ns", "UTC"),
         "price": pl.Float64,
         "size": pl.Float64,
+        "quote_filled": pl.Float64,
+        "taker_fee": pl.Float64,
+        "maker_rebate": pl.Float64,
         "side": pl.Utf8,
         "market": pl.Utf8,
+        "action_explanation": pl.Utf8,
         "tx_sig": pl.Utf8,
     }
 
