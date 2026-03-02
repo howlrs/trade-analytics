@@ -237,3 +237,74 @@ IF rvol_24h > trailing_90d_median:
 
 **不可能。** 遷移は急激で、事前兆候がない（delta_z が負 = 遷移直前にむしろ安定方向）。
 → レジームの「検出」は即座に可能だが「予測」は不可。反応速度が重要。
+
+## 9. FR-Biased Inventory 戦略
+
+### Drift FR 構造的プレミアム
+
+- Drift 累積8h FR: 平均 +1.32%（Bybitの0.006%と比較して桁違い）
+- FR divergence: 平均 +1.31% per 8h = **14.36% APR**
+- 高持続性: AC=0.85 (8h), AC=0.51 (1w)
+- 極端値からは平均回帰 (P90→次期間 -0.94%, t=-3.65)
+
+### FR-Biased MM Backtest結果
+
+reservation_price に FR bias を追加:
+`r = mid - q*gamma*sigma²*tau + alpha * FR_EMA(8h)`
+
+| alpha | Sharpe | Total PnL | MaxDD |
+|-------|--------|-----------|-------|
+| 0 | 0.00 | 0.00 | — |
+| 50 | 0.72 | 108.32 | -58.15 |
+| **100** | **0.98** | **182.65** | **-82.22** |
+| 200 | 0.90 | 224.32 | -116.82 |
+| 500 | 0.65 | 198.71 | -201.45 |
+
+**alpha=100 が最適。PnLの27%がFR収入。**
+
+### Mark-Oracle Premium
+
+- Price方向予測力: R²=0.05% (1h), 0.08% (8h) → **使えない**
+- asymmetric quoting への応用: hit rate差 1.4% → **不十分**
+
+## 10. Adverse Selection 分解（Glosten-Milgrom）
+
+### Bid-Ask 情報非対称性
+
+| Spread | Bid PI (4h) | Ask PI (4h) | 差分 | 解釈 |
+|--------|-----------|-----------|------|------|
+| 5bp | +8bp | -4bp | 12bp | buy-side informed |
+| 25bp | +6bp | -6bp | 12bp | 安定 |
+| 50bp | +5bp | -7bp | 12bp | 安定 |
+
+**buy-side が構造的に informed**（65%のDrift fillが CEX price 上）。
+
+### 最強AS予測因子: モメンタムコンテキスト
+
+| 条件 | Bid PI shift | Volume regime shift | Vol regime shift |
+|------|-------------|-------------------|-----------------|
+| 値 | **24.1bp** | 7.0bp | 6.5bp |
+
+- Up-momentum: bid PI = +17.9bp（buy-side 猛毒）
+- Down-momentum: bid PI = -6.2bp（sell-side 毒）
+
+**→ 直近4hリターン方向でクオートの非対称性を制御すべき。**
+
+### 時間帯別AS
+
+| UTC | 支配的フロー | 推奨 |
+|-----|-------------|------|
+| 9-13 | sell-side informed | ask側を広げる |
+| 14-18 | バランス（低AS） | **最適クオーティング窓** |
+| 19-22 | buy-side informed | bid側を広げる |
+
+### Drift AS のトレンド
+
+| 年 | Fill-CEX Premium (bp) |
+|----|---------------------|
+| 2023 | +10.6 |
+| 2024 | +5.2 |
+| 2025 | +1.3 |
+| 2026 | **-7.3** |
+
+→ 2026年はfill < CEX（maker有利レジーム）。AS環境は改善中。
