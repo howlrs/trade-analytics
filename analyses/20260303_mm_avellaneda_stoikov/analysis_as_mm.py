@@ -10,690 +10,792 @@ Model:
   reservation_price = mid - q * gamma * sigma^2 * (T-t)
   optimal_spread = gamma * sigma^2 * (T-t) + (2/gamma) * ln(1 + gamma/kappa)
   where sigma is in price-space: sigma_price = rvol_24h * mid_price
-
-Usage:
-    python3 analyses/20260303_mm_avellaneda_stoikov/analysis_as_mm.py
 """
 
-from __future__ import annotations
+import marimo
 
-import itertools
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import NamedTuple
-
-import numpy as np
-import polars as pl
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
-MAKER_FEE_BPS = 2.0       # 0.02% per fill (one side)
-TAKER_FEE_BPS = 8.0       # round-trip taker reference (not used in MM)
-HOURS_PER_YEAR = 8760
-TRAIN_CUTOFF = "2025-09-01"  # Train < cutoff, Test >= cutoff
-
-SYMBOLS = ["ETH", "SOL"]
+__generated_with = "0.20.2"
+app = marimo.App(width="medium")
 
 
 # ---------------------------------------------------------------------------
-# Data loading & feature engineering
+# Cell 1: Setup (imports, constants)
 # ---------------------------------------------------------------------------
+@app.cell
+def setup():
+    from __future__ import annotations
 
-def load_ohlcv(symbol: str) -> pl.DataFrame:
-    """Load 1h OHLCV from Binance and compute vol features."""
-    path = DATA_DIR / f"binance_{symbol.lower()}usdt_1h.parquet"
-    df = pl.read_parquet(path)
+    import itertools
+    from dataclasses import dataclass, field
+    from pathlib import Path
+    from typing import NamedTuple
 
-    # Normalise timestamp
-    df = df.with_columns(
-        pl.col("timestamp").dt.replace_time_zone(None).cast(pl.Datetime("us")).alias("timestamp")
-    )
-    df = df.sort("timestamp")
+    import marimo as mo
+    import numpy as np
+    import polars as pl
 
-    # Returns and realised vol
-    df = df.with_columns([
-        (pl.col("close").log() - pl.col("close").shift(1).log()).alias("log_ret"),
-        ((pl.col("high") - pl.col("low")) / pl.col("close")).alias("range_pct"),
-    ])
+    DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+    MAKER_FEE_BPS = 2.0
+    TAKER_FEE_BPS = 8.0
+    HOURS_PER_YEAR = 8760
+    TRAIN_CUTOFF = "2025-09-01"
+    SYMBOLS = ["ETH", "SOL"]
 
-    # Realised vol (24h rolling std of log returns — hourly fractional)
-    df = df.with_columns([
-        pl.col("log_ret").rolling_std(24).alias("rvol_24h"),
-        pl.col("range_pct").rolling_mean(24).alias("avg_range_24h"),
-    ])
-
-    # Mid price for convenience
-    df = df.with_columns(
-        ((pl.col("high") + pl.col("low")) / 2.0).alias("mid")
-    )
-
-    return df.drop_nulls(subset=["rvol_24h"])
-
-
-def split_train_test(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
-    cutoff = pl.lit(TRAIN_CUTOFF).str.strptime(pl.Datetime("us"), "%Y-%m-%d")
-    train = df.filter(pl.col("timestamp") < cutoff)
-    test = df.filter(pl.col("timestamp") >= cutoff)
-    return train, test
-
-
-# ---------------------------------------------------------------------------
-# Avellaneda-Stoikov helpers
-# ---------------------------------------------------------------------------
-
-def as_reservation_price(mid: float, q: float, gamma: float, sigma: float, tau: float) -> float:
-    """Reservation price: r = mid - q * gamma * sigma^2 * tau
-    sigma here is in PRICE space (sigma_price = rvol * mid).
-    """
-    return mid - q * gamma * sigma * sigma * tau
-
-
-def as_optimal_spread(gamma: float, sigma: float, tau: float, kappa: float) -> float:
-    """Optimal spread: delta = gamma * sigma^2 * tau + (2/gamma) * ln(1 + gamma/kappa)
-    sigma here is in PRICE space.
-    """
-    return gamma * sigma * sigma * tau + (2.0 / gamma) * np.log(1.0 + gamma / kappa)
-
-
-# ---------------------------------------------------------------------------
-# Simulation
-# ---------------------------------------------------------------------------
-
-@dataclass
-class MMState:
-    cash: float = 0.0
-    inventory: float = 0.0
-    n_bid_fills: int = 0
-    n_ask_fills: int = 0
-    n_both_fills: int = 0
-    n_no_fills: int = 0
-    n_periods: int = 0
-    pnl_history: list[float] = field(default_factory=list)
-    inventory_history: list[float] = field(default_factory=list)
-    spread_history: list[float] = field(default_factory=list)
-
-
-class QuoteResult(NamedTuple):
-    bid: float
-    ask: float
-    spread_bps: float  # spread in bps for diagnostics
-
-
-def compute_quotes_as(
-    mid: float,
-    q: float,
-    gamma: float,
-    sigma_ret: float,
-    kappa: float,
-    T_hours: int,
-    t_in_cycle: int,
-) -> QuoteResult:
-    """Compute AS bid/ask quotes with inventory skew.
-
-    sigma_ret: fractional return vol (rvol_24h)
-    Converts to price-space: sigma_price = sigma_ret * mid
-    """
-    tau = max((T_hours - t_in_cycle) / T_hours, 0.01)
-    sigma_price = sigma_ret * mid
-
-    reservation = as_reservation_price(mid, q, gamma, sigma_price, tau)
-    spread = as_optimal_spread(gamma, sigma_price, tau, kappa)
-    half_spread = spread / 2.0
-
-    bid = reservation - half_spread
-    ask = reservation + half_spread
-
-    spread_bps = (ask - bid) / mid * 10000.0
-    return QuoteResult(bid=bid, ask=ask, spread_bps=spread_bps)
-
-
-def compute_quotes_fixed(mid: float, spread_bps: float) -> QuoteResult:
-    """Fixed symmetric spread around mid."""
-    half = mid * spread_bps / 10000.0 / 2.0
-    return QuoteResult(bid=mid - half, ask=mid + half, spread_bps=spread_bps)
-
-
-def run_simulation(
-    df: pl.DataFrame,
-    strategy: str,
-    *,
-    gamma: float = 0.1,
-    kappa: float = 1.0,
-    T_hours: int = 24,
-    inv_limit: int = 10,
-    fixed_spread_bps: float = 50.0,
-    regime_aware: bool = False,
-    vol_percentile_70: float | None = None,
-) -> MMState:
-    """
-    Run MM simulation on OHLCV data.
-
-    strategy: 'fixed', 'as_naive', 'as_regime'
-    Fill logic: bid filled if next_low <= bid, ask filled if next_high >= ask.
-    Maker fee applied per fill side.
-    """
-    state = MMState()
-    maker_fee_frac = MAKER_FEE_BPS / 10000.0
-
-    # Extract numpy arrays for speed
-    highs = df["high"].to_numpy()
-    lows = df["low"].to_numpy()
-    closes = df["close"].to_numpy()
-    mids = df["mid"].to_numpy()
-    sigmas = df["rvol_24h"].to_numpy()
-
-    n = len(df)
-
-    for i in range(n - 1):
-        state.n_periods += 1
-        mid = mids[i]
-        sigma = sigmas[i]
-
-        # Time within cycle
-        t_in_cycle = i % T_hours
-
-        # Determine quotes
-        if strategy == "fixed":
-            q = compute_quotes_fixed(mid, fixed_spread_bps)
-        elif strategy == "as_naive":
-            q = compute_quotes_as(
-                mid, state.inventory, gamma, sigma, kappa, T_hours, t_in_cycle,
-            )
-        elif strategy == "as_regime":
-            g = gamma
-            if regime_aware and vol_percentile_70 is not None:
-                if sigma > vol_percentile_70:
-                    g = gamma * 3.0  # more risk averse in high vol
-            q = compute_quotes_as(
-                mid, state.inventory, g, sigma, kappa, T_hours, t_in_cycle,
-            )
-        else:
-            raise ValueError(f"Unknown strategy: {strategy}")
-
-        bid_price, ask_price = q.bid, q.ask
-        state.spread_history.append(q.spread_bps)
-
-        # Next bar's price action for fill determination
-        next_low = lows[i + 1]
-        next_high = highs[i + 1]
-        next_close = closes[i + 1]
-
-        bid_filled = False
-        ask_filled = False
-
-        # Check fills (with inventory limits)
-        if next_low <= bid_price and state.inventory < inv_limit:
-            bid_filled = True
-            state.inventory += 1
-            state.cash -= bid_price * (1.0 + maker_fee_frac)
-            state.n_bid_fills += 1
-
-        if next_high >= ask_price and state.inventory > -inv_limit:
-            ask_filled = True
-            state.inventory -= 1
-            state.cash += ask_price * (1.0 - maker_fee_frac)
-            state.n_ask_fills += 1
-
-        if bid_filled and ask_filled:
-            state.n_both_fills += 1
-        elif not bid_filled and not ask_filled:
-            state.n_no_fills += 1
-
-        state.inventory_history.append(state.inventory)
-
-        # Mark-to-market PnL
-        mtm = state.cash + state.inventory * next_close
-        state.pnl_history.append(mtm)
-
-    return state
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Metrics:
-    sharpe: float
-    total_pnl_bps: float
-    max_drawdown_pct: float
-    avg_abs_inventory: float
-    fill_rate_both: float
-    fill_rate_one: float
-    fill_rate_none: float
-    pnl_per_fill: float
-    total_fills: int
-    n_periods: int
-    avg_spread_bps: float
-
-
-def compute_metrics(state: MMState, initial_price: float) -> Metrics:
-    """Compute performance metrics from simulation state."""
-    pnl = np.array(state.pnl_history)
-    inv = np.array(state.inventory_history)
-    spreads = np.array(state.spread_history)
-
-    if len(pnl) < 2:
-        return Metrics(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-
-    # Hourly returns
-    returns = np.diff(pnl)
-    mean_ret = np.mean(returns)
-    std_ret = np.std(returns)
-
-    sharpe = (mean_ret / std_ret * np.sqrt(HOURS_PER_YEAR)) if std_ret > 0 else 0.0
-
-    # Total PnL in bps of initial price
-    total_pnl = pnl[-1]
-    total_pnl_bps = total_pnl / initial_price * 10000.0
-
-    # Max drawdown (in bps of initial price)
-    peak = np.maximum.accumulate(pnl)
-    drawdown = peak - pnl
-    max_dd_pct = np.max(drawdown) / initial_price * 100.0 if len(drawdown) > 0 else 0.0
-
-    total_fills = state.n_bid_fills + state.n_ask_fills
-    n = state.n_periods
-
-    avg_abs_inv = np.mean(np.abs(inv)) if len(inv) > 0 else 0.0
-    avg_spread = np.mean(spreads) if len(spreads) > 0 else 0.0
-
-    return Metrics(
-        sharpe=sharpe,
-        total_pnl_bps=total_pnl_bps,
-        max_drawdown_pct=max_dd_pct,
-        avg_abs_inventory=avg_abs_inv,
-        fill_rate_both=state.n_both_fills / n if n > 0 else 0,
-        fill_rate_one=(state.n_bid_fills + state.n_ask_fills - 2 * state.n_both_fills) / n if n > 0 else 0,
-        fill_rate_none=state.n_no_fills / n if n > 0 else 0,
-        pnl_per_fill=total_pnl / total_fills if total_fills > 0 else 0,
-        total_fills=total_fills,
-        n_periods=n,
-        avg_spread_bps=avg_spread,
+    return (
+        DATA_DIR,
+        HOURS_PER_YEAR,
+        MAKER_FEE_BPS,
+        SYMBOLS,
+        TAKER_FEE_BPS,
+        TRAIN_CUTOFF,
+        dataclass,
+        field,
+        itertools,
+        mo,
+        np,
+        pl,
+        NamedTuple,
+        Path,
     )
 
 
 # ---------------------------------------------------------------------------
-# Grid search
+# Cell 2: Data loading & feature engineering
 # ---------------------------------------------------------------------------
+@app.cell
+def data_funcs(DATA_DIR, TRAIN_CUTOFF, pl):
+    def load_ohlcv(symbol: str) -> pl.DataFrame:
+        """Load 1h OHLCV from Binance and compute vol features."""
+        _path = DATA_DIR / f"binance_{symbol.lower()}usdt_1h.parquet"
+        _df = pl.read_parquet(_path)
 
-def grid_search_as(
-    train_df: pl.DataFrame,
-    test_df: pl.DataFrame,
-    symbol: str,
-) -> list:
-    """Run parameter grid search for AS model on train, evaluate best on test."""
-    gammas = [0.01, 0.1, 1.0, 10.0]
-    kappas = [0.5, 1.0, 2.0, 5.0]
-    T_hours_list = [8, 24]
-    inv_limits = [5, 10, 20]
-
-    initial_price_train = train_df["close"][0]
-    initial_price_test = test_df["close"][0]
-
-    print(f"\n{'='*110}")
-    print(f"  GRID SEARCH: {symbol} -- AS Naive Model")
-    print(f"  Train: {len(train_df)} bars, Test: {len(test_df)} bars")
-    print(f"{'='*110}")
-    print(f"{'gamma':>8} {'kappa':>8} {'T':>4} {'inv_lim':>8} | "
-          f"{'Sharpe':>8} {'PnL(bps)':>10} {'MaxDD%':>8} {'Fills':>7} "
-          f"{'Both%':>7} {'None%':>7} {'AvgSprd':>8} {'AvgInv':>7}")
-    print("-" * 110)
-
-    results = []
-
-    for gamma, kappa, T_hours, inv_limit in itertools.product(gammas, kappas, T_hours_list, inv_limits):
-        state = run_simulation(
-            train_df,
-            strategy="as_naive",
-            gamma=gamma,
-            kappa=kappa,
-            T_hours=T_hours,
-            inv_limit=inv_limit,
+        _df = _df.with_columns(
+            pl.col("timestamp").dt.replace_time_zone(None).cast(pl.Datetime("us")).alias("timestamp")
         )
-        m = compute_metrics(state, initial_price_train)
-        results.append((gamma, kappa, T_hours, inv_limit, m))
+        _df = _df.sort("timestamp")
 
-        print(f"{gamma:8.2f} {kappa:8.2f} {T_hours:4d} {inv_limit:8d} | "
-              f"{m.sharpe:8.2f} {m.total_pnl_bps:10.1f} {m.max_drawdown_pct:8.2f} "
-              f"{m.total_fills:7d} {m.fill_rate_both*100:6.1f}% {m.fill_rate_none*100:6.1f}% "
-              f"{m.avg_spread_bps:7.1f}bp {m.avg_abs_inventory:6.1f}")
+        _df = _df.with_columns([
+            (pl.col("close").log() - pl.col("close").shift(1).log()).alias("log_ret"),
+            ((pl.col("high") - pl.col("low")) / pl.col("close")).alias("range_pct"),
+        ])
 
-    # Sort by Sharpe
-    results.sort(key=lambda x: x[4].sharpe, reverse=True)
+        _df = _df.with_columns([
+            pl.col("log_ret").rolling_std(24).alias("rvol_24h"),
+            pl.col("range_pct").rolling_mean(24).alias("avg_range_24h"),
+        ])
 
-    print(f"\n{'='*70}")
-    print(f"  TOP 10 CONFIGS by Sharpe (Train) -- {symbol}")
-    print(f"{'='*70}")
-    for rank, (gamma, kappa, T_hours, inv_limit, m) in enumerate(results[:10], 1):
-        print(f"  #{rank}: gamma={gamma}, kappa={kappa}, T={T_hours}h, inv_limit={inv_limit}")
-        print(f"       Sharpe={m.sharpe:.3f}, PnL={m.total_pnl_bps:.1f}bps, "
-              f"MaxDD={m.max_drawdown_pct:.2f}%, Fills={m.total_fills}, "
-              f"AvgSpread={m.avg_spread_bps:.1f}bp, AvgInv={m.avg_abs_inventory:.1f}")
-
-    # Evaluate top 5 on Test
-    print(f"\n{'='*70}")
-    print(f"  TEST EVALUATION -- Top 5 configs -- {symbol}")
-    print(f"{'='*70}")
-    for rank, (gamma, kappa, T_hours, inv_limit, train_m) in enumerate(results[:5], 1):
-        state_test = run_simulation(
-            test_df,
-            strategy="as_naive",
-            gamma=gamma,
-            kappa=kappa,
-            T_hours=T_hours,
-            inv_limit=inv_limit,
+        _df = _df.with_columns(
+            ((pl.col("high") + pl.col("low")) / 2.0).alias("mid")
         )
-        mt = compute_metrics(state_test, initial_price_test)
-        print(f"  #{rank}: gamma={gamma}, kappa={kappa}, T={T_hours}h, inv_limit={inv_limit}")
-        print(f"       [Train] Sharpe={train_m.sharpe:.3f}, PnL={train_m.total_pnl_bps:.1f}bps")
-        print(f"       [Test]  Sharpe={mt.sharpe:.3f}, PnL={mt.total_pnl_bps:.1f}bps, "
-              f"MaxDD={mt.max_drawdown_pct:.2f}%, Fills={mt.total_fills}, "
-              f"AvgSpread={mt.avg_spread_bps:.1f}bp, AvgInv={mt.avg_abs_inventory:.1f}, "
-              f"PnL/Fill={mt.pnl_per_fill:.4f}")
 
-    return results
+        return _df.drop_nulls(subset=["rvol_24h"])
+
+    def split_train_test(df: pl.DataFrame) -> tuple:
+        _cutoff = pl.lit(TRAIN_CUTOFF).str.strptime(pl.Datetime("us"), "%Y-%m-%d")
+        _train = df.filter(pl.col("timestamp") < _cutoff)
+        _test = df.filter(pl.col("timestamp") >= _cutoff)
+        return _train, _test
+
+    return load_ohlcv, split_train_test
 
 
 # ---------------------------------------------------------------------------
-# Strategy comparison
+# Cell 3: AS model helper functions
 # ---------------------------------------------------------------------------
+@app.cell
+def as_helpers(np):
+    def as_reservation_price(mid: float, q: float, gamma: float, sigma: float, tau: float) -> float:
+        """Reservation price: r = mid - q * gamma * sigma^2 * tau
+        sigma here is in PRICE space (sigma_price = rvol * mid).
+        """
+        return mid - q * gamma * sigma * sigma * tau
 
-def compare_strategies(
-    train_df: pl.DataFrame,
-    test_df: pl.DataFrame,
-    symbol: str,
-    best_gamma: float,
-    best_kappa: float,
-    best_T: int,
-    best_inv: int,
-) -> None:
-    """Compare Fixed, AS Naive, and AS Regime strategies on test set."""
-    initial_price = test_df["close"][0]
+    def as_optimal_spread(gamma: float, sigma: float, tau: float, kappa: float) -> float:
+        """Optimal spread: delta = gamma * sigma^2 * tau + (2/gamma) * ln(1 + gamma/kappa)
+        sigma here is in PRICE space.
+        """
+        return gamma * sigma * sigma * tau + (2.0 / gamma) * np.log(1.0 + gamma / kappa)
 
-    # Compute vol percentile from train for regime detection
-    vol_p70 = float(train_df["rvol_24h"].quantile(0.70))
+    return as_reservation_price, as_optimal_spread
 
-    strategies = [
-        ("Fixed 50bp", dict(strategy="fixed", fixed_spread_bps=50.0, inv_limit=best_inv)),
-        ("Fixed 100bp", dict(strategy="fixed", fixed_spread_bps=100.0, inv_limit=best_inv)),
-        ("AS Naive", dict(
-            strategy="as_naive", gamma=best_gamma, kappa=best_kappa,
-            T_hours=best_T, inv_limit=best_inv,
-        )),
-        ("AS Regime-Aware", dict(
-            strategy="as_regime", gamma=best_gamma, kappa=best_kappa,
-            T_hours=best_T, inv_limit=best_inv,
-            regime_aware=True, vol_percentile_70=vol_p70,
-        )),
+
+# ---------------------------------------------------------------------------
+# Cell 4: Simulation infrastructure
+# ---------------------------------------------------------------------------
+@app.cell
+def simulation_infra(
+    MAKER_FEE_BPS,
+    as_optimal_spread,
+    as_reservation_price,
+    dataclass,
+    field,
+    np,
+    NamedTuple,
+):
+    @dataclass
+    class MMState:
+        cash: float = 0.0
+        inventory: float = 0.0
+        n_bid_fills: int = 0
+        n_ask_fills: int = 0
+        n_both_fills: int = 0
+        n_no_fills: int = 0
+        n_periods: int = 0
+        pnl_history: list[float] = field(default_factory=list)
+        inventory_history: list[float] = field(default_factory=list)
+        spread_history: list[float] = field(default_factory=list)
+
+    class QuoteResult(NamedTuple):
+        bid: float
+        ask: float
+        spread_bps: float
+
+    def compute_quotes_as(
+        mid: float,
+        q: float,
+        gamma: float,
+        sigma_ret: float,
+        kappa: float,
+        T_hours: int,
+        t_in_cycle: int,
+    ) -> QuoteResult:
+        """Compute AS bid/ask quotes with inventory skew."""
+        _tau = max((T_hours - t_in_cycle) / T_hours, 0.01)
+        _sigma_price = sigma_ret * mid
+        _reservation = as_reservation_price(mid, q, gamma, _sigma_price, _tau)
+        _spread = as_optimal_spread(gamma, _sigma_price, _tau, kappa)
+        _half_spread = _spread / 2.0
+        _bid = _reservation - _half_spread
+        _ask = _reservation + _half_spread
+        _spread_bps = (_ask - _bid) / mid * 10000.0
+        return QuoteResult(bid=_bid, ask=_ask, spread_bps=_spread_bps)
+
+    def compute_quotes_fixed(mid: float, spread_bps: float) -> QuoteResult:
+        """Fixed symmetric spread around mid."""
+        _half = mid * spread_bps / 10000.0 / 2.0
+        return QuoteResult(bid=mid - _half, ask=mid + _half, spread_bps=spread_bps)
+
+    def run_simulation(
+        df,
+        strategy: str,
+        *,
+        gamma: float = 0.1,
+        kappa: float = 1.0,
+        T_hours: int = 24,
+        inv_limit: int = 10,
+        fixed_spread_bps: float = 50.0,
+        regime_aware: bool = False,
+        vol_percentile_70: float | None = None,
+    ) -> MMState:
+        """
+        Run MM simulation on OHLCV data.
+
+        strategy: 'fixed', 'as_naive', 'as_regime'
+        Fill logic: bid filled if next_low <= bid, ask filled if next_high >= ask.
+        Maker fee applied per fill side.
+        """
+        _state = MMState()
+        _maker_fee_frac = MAKER_FEE_BPS / 10000.0
+
+        _highs = df["high"].to_numpy()
+        _lows = df["low"].to_numpy()
+        _closes = df["close"].to_numpy()
+        _mids = df["mid"].to_numpy()
+        _sigmas = df["rvol_24h"].to_numpy()
+
+        _n = len(df)
+
+        for _i in range(_n - 1):
+            _state.n_periods += 1
+            _mid = _mids[_i]
+            _sigma = _sigmas[_i]
+            _t_in_cycle = _i % T_hours
+
+            if strategy == "fixed":
+                _q = compute_quotes_fixed(_mid, fixed_spread_bps)
+            elif strategy == "as_naive":
+                _q = compute_quotes_as(
+                    _mid, _state.inventory, gamma, _sigma, kappa, T_hours, _t_in_cycle,
+                )
+            elif strategy == "as_regime":
+                _g = gamma
+                if regime_aware and vol_percentile_70 is not None:
+                    if _sigma > vol_percentile_70:
+                        _g = gamma * 3.0
+                _q = compute_quotes_as(
+                    _mid, _state.inventory, _g, _sigma, kappa, T_hours, _t_in_cycle,
+                )
+            else:
+                raise ValueError(f"Unknown strategy: {strategy}")
+
+            _bid_price, _ask_price = _q.bid, _q.ask
+            _state.spread_history.append(_q.spread_bps)
+
+            _next_low = _lows[_i + 1]
+            _next_high = _highs[_i + 1]
+            _next_close = _closes[_i + 1]
+
+            _bid_filled = False
+            _ask_filled = False
+
+            if _next_low <= _bid_price and _state.inventory < inv_limit:
+                _bid_filled = True
+                _state.inventory += 1
+                _state.cash -= _bid_price * (1.0 + _maker_fee_frac)
+                _state.n_bid_fills += 1
+
+            if _next_high >= _ask_price and _state.inventory > -inv_limit:
+                _ask_filled = True
+                _state.inventory -= 1
+                _state.cash += _ask_price * (1.0 - _maker_fee_frac)
+                _state.n_ask_fills += 1
+
+            if _bid_filled and _ask_filled:
+                _state.n_both_fills += 1
+            elif not _bid_filled and not _ask_filled:
+                _state.n_no_fills += 1
+
+            _state.inventory_history.append(_state.inventory)
+
+            _mtm = _state.cash + _state.inventory * _next_close
+            _state.pnl_history.append(_mtm)
+
+        return _state
+
+    return MMState, QuoteResult, compute_quotes_as, compute_quotes_fixed, run_simulation
+
+
+# ---------------------------------------------------------------------------
+# Cell 5: Metrics
+# ---------------------------------------------------------------------------
+@app.cell
+def metrics_cell(dataclass, np, HOURS_PER_YEAR):
+    @dataclass
+    class Metrics:
+        sharpe: float
+        total_pnl_bps: float
+        max_drawdown_pct: float
+        avg_abs_inventory: float
+        fill_rate_both: float
+        fill_rate_one: float
+        fill_rate_none: float
+        pnl_per_fill: float
+        total_fills: int
+        n_periods: int
+        avg_spread_bps: float
+
+    def compute_metrics(state, initial_price: float) -> Metrics:
+        """Compute performance metrics from simulation state."""
+        _pnl = np.array(state.pnl_history)
+        _inv = np.array(state.inventory_history)
+        _spreads = np.array(state.spread_history)
+
+        if len(_pnl) < 2:
+            return Metrics(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+        _returns = np.diff(_pnl)
+        _mean_ret = np.mean(_returns)
+        _std_ret = np.std(_returns)
+
+        _sharpe = (_mean_ret / _std_ret * np.sqrt(HOURS_PER_YEAR)) if _std_ret > 0 else 0.0
+
+        _total_pnl = _pnl[-1]
+        _total_pnl_bps = _total_pnl / initial_price * 10000.0
+
+        _peak = np.maximum.accumulate(_pnl)
+        _drawdown = _peak - _pnl
+        _max_dd_pct = np.max(_drawdown) / initial_price * 100.0 if len(_drawdown) > 0 else 0.0
+
+        _total_fills = state.n_bid_fills + state.n_ask_fills
+        _n = state.n_periods
+
+        _avg_abs_inv = np.mean(np.abs(_inv)) if len(_inv) > 0 else 0.0
+        _avg_spread = np.mean(_spreads) if len(_spreads) > 0 else 0.0
+
+        return Metrics(
+            sharpe=_sharpe,
+            total_pnl_bps=_total_pnl_bps,
+            max_drawdown_pct=_max_dd_pct,
+            avg_abs_inventory=_avg_abs_inv,
+            fill_rate_both=state.n_both_fills / _n if _n > 0 else 0,
+            fill_rate_one=(state.n_bid_fills + state.n_ask_fills - 2 * state.n_both_fills) / _n if _n > 0 else 0,
+            fill_rate_none=state.n_no_fills / _n if _n > 0 else 0,
+            pnl_per_fill=_total_pnl / _total_fills if _total_fills > 0 else 0,
+            total_fills=_total_fills,
+            n_periods=_n,
+            avg_spread_bps=_avg_spread,
+        )
+
+    return Metrics, compute_metrics
+
+
+# ---------------------------------------------------------------------------
+# Cell 6: Load data for both symbols
+# ---------------------------------------------------------------------------
+@app.cell
+def load_data(mo, SYMBOLS, MAKER_FEE_BPS, TRAIN_CUTOFF, load_ohlcv, split_train_test):
+    datasets = {}
+    for _sym in SYMBOLS:
+        _df = load_ohlcv(_sym)
+        _train, _test = split_train_test(_df)
+        datasets[_sym] = {"full": _df, "train": _train, "test": _test}
+
+    _lines = [
+        "# Avellaneda-Stoikov Market Making Backtest",
+        "",
+        "Focus: ETH, SOL | Data: 1h OHLCV (Binance)",
+        f"- Train: < {TRAIN_CUTOFF} | Test: >= {TRAIN_CUTOFF}",
+        f"- Maker fee: {MAKER_FEE_BPS}bps per fill | sigma in price-space: sigma_price = rvol_24h * mid",
+        "",
     ]
-
-    print(f"\n{'='*120}")
-    print(f"  STRATEGY COMPARISON (Test Set) -- {symbol}")
-    print(f"  Best AS params: gamma={best_gamma}, kappa={best_kappa}, T={best_T}h, inv_limit={best_inv}")
-    print(f"  Vol P70 threshold: {vol_p70:.6f}")
-    print(f"{'='*120}")
-    print(f"{'Strategy':<20} | {'Sharpe':>8} {'PnL(bps)':>10} {'MaxDD%':>8} "
-          f"{'Fills':>7} {'Both%':>7} {'None%':>7} {'AvgSprd':>8} "
-          f"{'AvgInv':>7} {'PnL/Fill':>10} {'FinalInv':>9}")
-    print("-" * 120)
-
-    for name, kwargs in strategies:
-        state = run_simulation(test_df, **kwargs)
-        m = compute_metrics(state, initial_price)
-        print(f"{name:<20} | {m.sharpe:8.2f} {m.total_pnl_bps:10.1f} {m.max_drawdown_pct:8.2f} "
-              f"{m.total_fills:7d} {m.fill_rate_both*100:6.1f}% {m.fill_rate_none*100:6.1f}% "
-              f"{m.avg_spread_bps:7.1f}bp {m.avg_abs_inventory:6.1f} "
-              f"{m.pnl_per_fill:10.4f} {state.inventory:9.1f}")
-
-
-# ---------------------------------------------------------------------------
-# Detailed simulation with inventory tracking
-# ---------------------------------------------------------------------------
-
-def run_detailed_simulation(
-    df: pl.DataFrame,
-    symbol: str,
-    gamma: float,
-    kappa: float,
-    T_hours: int,
-    inv_limit: int,
-) -> None:
-    """Run simulation and print monthly breakdown with inventory stats."""
-    state = run_simulation(
-        df, strategy="as_naive",
-        gamma=gamma, kappa=kappa, T_hours=T_hours, inv_limit=inv_limit,
-    )
-
-    timestamps = df["timestamp"].to_list()
-    closes = df["close"].to_numpy()
-    initial_price = closes[0]
-    pnl_arr = np.array(state.pnl_history)
-    inv_arr = np.array(state.inventory_history)
-    spread_arr = np.array(state.spread_history)
-
-    # Monthly aggregation
-    monthly: dict[str, dict] = {}
-    n = len(pnl_arr)
-    for i in range(n):
-        month_key = timestamps[i].strftime("%Y-%m")
-        if month_key not in monthly:
-            monthly[month_key] = {"n": 0, "start_idx": i, "end_idx": i}
-        monthly[month_key]["n"] += 1
-        monthly[month_key]["end_idx"] = i
-
-    # Reconstruct per-period fill info from inventory changes
-    # inv_arr[i] is inventory AFTER period i's fills
-    # bid fill => inv +1, ask fill => inv -1
-    # We can detect fills from inventory changes
-
-    print(f"\n{'='*90}")
-    print(f"  DETAILED MONTHLY BREAKDOWN -- {symbol}")
-    print(f"  gamma={gamma}, kappa={kappa}, T={T_hours}h, inv_limit={inv_limit}")
-    print(f"{'='*90}")
-    print(f"{'Month':<10} | {'Bars':>5} {'AvgInv':>7} {'MaxInv':>7} "
-          f"{'AvgSprd':>8} {'MonthPnL':>12} {'CumPnL':>12} {'CumBps':>9}")
-    print("-" * 90)
-
-    sorted_months = sorted(monthly.keys())
-    for month in sorted_months:
-        d = monthly[month]
-        si, ei = d["start_idx"], d["end_idx"]
-        month_inv = inv_arr[si:ei+1]
-        month_spread = spread_arr[si:ei+1]
-        month_pnl_start = pnl_arr[si - 1] if si > 0 else 0.0
-        month_pnl_end = pnl_arr[ei]
-        month_pnl = month_pnl_end - month_pnl_start
-        cum_pnl_bps = month_pnl_end / initial_price * 10000.0
-
-        print(f"{month:<10} | {d['n']:5d} {np.mean(np.abs(month_inv)):6.1f} "
-              f"{np.max(np.abs(month_inv)):7.1f} {np.mean(month_spread):7.1f}bp "
-              f"{month_pnl:12.2f} {month_pnl_end:12.2f} {cum_pnl_bps:8.1f}bp")
-
-    print(f"\n  Full-period inventory stats:")
-    print(f"    Mean absolute: {np.mean(np.abs(inv_arr)):.2f}")
-    print(f"    Max absolute:  {np.max(np.abs(inv_arr)):.2f}")
-    print(f"    Std:           {np.std(inv_arr):.2f}")
-    print(f"    Final:         {state.inventory:.1f}")
-    print(f"    Final PnL:     {pnl_arr[-1]:.2f} ({pnl_arr[-1]/initial_price*10000:.1f} bps)")
-    print(f"  Full-period spread stats:")
-    print(f"    Mean:   {np.mean(spread_arr):.1f} bp")
-    print(f"    Median: {np.median(spread_arr):.1f} bp")
-    print(f"    P10:    {np.percentile(spread_arr, 10):.1f} bp")
-    print(f"    P90:    {np.percentile(spread_arr, 90):.1f} bp")
-    print(f"  Fill stats:")
-    print(f"    Bid fills:  {state.n_bid_fills}")
-    print(f"    Ask fills:  {state.n_ask_fills}")
-    print(f"    Both:       {state.n_both_fills} ({state.n_both_fills/state.n_periods*100:.1f}%)")
-    print(f"    None:       {state.n_no_fills} ({state.n_no_fills/state.n_periods*100:.1f}%)")
-
-
-# ---------------------------------------------------------------------------
-# Volatility analysis
-# ---------------------------------------------------------------------------
-
-def print_vol_stats(df: pl.DataFrame, symbol: str) -> None:
-    """Print volatility statistics for context."""
-    sigma = df["rvol_24h"].to_numpy()
-    mids = df["mid"].to_numpy()
-    # Show both fractional and price-space vol
-    sigma_price = sigma * mids
-    avg_mid = np.mean(mids)
-
-    print(f"\n  {symbol} Volatility (rvol_24h) Statistics:")
-    print(f"    --- Fractional (return-space) ---")
-    print(f"    Mean:   {np.mean(sigma):.6f}  ({np.mean(sigma)*10000:.1f} bp)")
-    print(f"    Median: {np.median(sigma):.6f}  ({np.median(sigma)*10000:.1f} bp)")
-    print(f"    P10:    {np.percentile(sigma, 10):.6f}")
-    print(f"    P70:    {np.percentile(sigma, 70):.6f}")
-    print(f"    P90:    {np.percentile(sigma, 90):.6f}")
-    print(f"    --- Price-space (sigma * mid) ---")
-    print(f"    Mean:   {np.mean(sigma_price):.2f}")
-    print(f"    Median: {np.median(sigma_price):.2f}")
-    print(f"    Avg mid price: {avg_mid:.2f}")
-    # Autocorrelation
-    ac1 = np.corrcoef(sigma[:-1], sigma[1:])[0, 1]
-    print(f"    AC(1):  {ac1:.4f}")
-
-
-# ---------------------------------------------------------------------------
-# Spread diagnostics
-# ---------------------------------------------------------------------------
-
-def print_spread_diagnostics(symbol: str, mid: float, sigma_ret: float) -> None:
-    """Show what AS spreads look like for a few parameter combos."""
-    print(f"\n  {symbol} Spread Diagnostics (mid={mid:.2f}, sigma_ret={sigma_ret:.6f}):")
-    print(f"  {'gamma':>8} {'kappa':>8} {'T':>4} {'tau':>6} | {'spread':>10} {'spread_bp':>10}")
-    print(f"  {'-'*60}")
-    for gamma in [0.01, 0.1, 1.0, 10.0]:
-        for kappa in [0.5, 1.0, 5.0]:
-            for T in [8, 24]:
-                sigma_price = sigma_ret * mid
-                tau = 0.5  # mid-cycle
-                spread = as_optimal_spread(gamma, sigma_price, tau, kappa)
-                spread_bp = spread / mid * 10000
-                print(f"  {gamma:8.2f} {kappa:8.2f} {T:4d} {tau:6.2f} | "
-                      f"{spread:10.4f} {spread_bp:9.1f}bp")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    print("=" * 110)
-    print("  AVELLANEDA-STOIKOV MARKET MAKING BACKTEST")
-    print("  Focus: ETH, SOL | Data: 1h OHLCV (Binance)")
-    print(f"  Train: < {TRAIN_CUTOFF} | Test: >= {TRAIN_CUTOFF}")
-    print(f"  Maker fee: {MAKER_FEE_BPS}bps per fill | sigma in price-space: sigma_price = rvol_24h * mid")
-    print("=" * 110)
-
-    all_best_configs: dict[str, tuple] = {}
-
-    for symbol in SYMBOLS:
-        print(f"\n\n{'#'*110}")
-        print(f"###  {symbol}  ###")
-        print(f"{'#'*110}")
-
-        df = load_ohlcv(symbol)
-        train_df, test_df = split_train_test(df)
-
-        print(f"\n  Data: {len(df)} total bars ({len(train_df)} train, {len(test_df)} test)")
-        print(f"  Price range: {df['close'].min():.2f} - {df['close'].max():.2f}")
-
-        print_vol_stats(train_df, symbol)
-
-        # Show what AS spreads look like at median vol
-        median_sigma = float(np.median(train_df["rvol_24h"].to_numpy()))
-        median_mid = float(np.median(train_df["mid"].to_numpy()))
-        print_spread_diagnostics(symbol, median_mid, median_sigma)
-
-        # ------- Grid Search -------
-        results = grid_search_as(train_df, test_df, symbol)
-
-        # Best config by Sharpe
-        best = results[0]
-        best_gamma, best_kappa, best_T, best_inv = best[0], best[1], best[2], best[3]
-        all_best_configs[symbol] = (best_gamma, best_kappa, best_T, best_inv)
-
-        # ------- Strategy Comparison -------
-        compare_strategies(
-            train_df, test_df, symbol,
-            best_gamma, best_kappa, best_T, best_inv,
+    for _sym in SYMBOLS:
+        _d = datasets[_sym]
+        _lines.append(
+            f"**{_sym}**: {len(_d['full'])} total bars "
+            f"({len(_d['train'])} train, {len(_d['test'])} test), "
+            f"price range: {_d['full']['close'].min():.2f} - {_d['full']['close'].max():.2f}"
         )
 
-        # ------- Detailed monthly breakdown on full dataset -------
-        run_detailed_simulation(
-            df, symbol, best_gamma, best_kappa, best_T, best_inv,
-        )
+    mo.md("\n".join(_lines))
+    return (datasets,)
 
-    # ---------------------------------------------------------------------------
-    # Summary
-    # ---------------------------------------------------------------------------
-    print(f"\n\n{'='*110}")
-    print("  FINAL SUMMARY")
-    print(f"{'='*110}")
-    for symbol in SYMBOLS:
-        g, k, t, inv = all_best_configs[symbol]
-        print(f"\n  {symbol}:")
-        print(f"    Best config: gamma={g}, kappa={k}, T={t}h, inv_limit={inv}")
 
-        df = load_ohlcv(symbol)
-        _, test_df = split_train_test(df)
-        initial_price = test_df["close"][0]
+# ---------------------------------------------------------------------------
+# Cell 7: Volatility stats display
+# ---------------------------------------------------------------------------
+@app.cell
+def vol_stats(mo, np, SYMBOLS, datasets):
+    _lines = ["## Volatility Statistics (Train Set)\n"]
 
-        vol_p70 = float(df.filter(
-            pl.col("timestamp") < pl.lit(TRAIN_CUTOFF).str.strptime(pl.Datetime("us"), "%Y-%m-%d")
-        )["rvol_24h"].quantile(0.70))
+    for _sym in SYMBOLS:
+        _train = datasets[_sym]["train"]
+        _sigma = _train["rvol_24h"].to_numpy()
+        _mids = _train["mid"].to_numpy()
+        _sigma_price = _sigma * _mids
+        _avg_mid = np.mean(_mids)
+        _ac1 = np.corrcoef(_sigma[:-1], _sigma[1:])[0, 1]
 
-        configs = [
-            ("Fixed 50bp", dict(strategy="fixed", fixed_spread_bps=50.0, inv_limit=inv)),
-            ("Fixed 100bp", dict(strategy="fixed", fixed_spread_bps=100.0, inv_limit=inv)),
-            ("AS Naive", dict(strategy="as_naive", gamma=g, kappa=k, T_hours=t, inv_limit=inv)),
-            ("AS Regime", dict(strategy="as_regime", gamma=g, kappa=k, T_hours=t, inv_limit=inv,
-                               regime_aware=True, vol_percentile_70=vol_p70)),
+        _lines.append(f"### {_sym}")
+        _lines.append("```")
+        _lines.append(f"  --- Fractional (return-space) ---")
+        _lines.append(f"  Mean:   {np.mean(_sigma):.6f}  ({np.mean(_sigma)*10000:.1f} bp)")
+        _lines.append(f"  Median: {np.median(_sigma):.6f}  ({np.median(_sigma)*10000:.1f} bp)")
+        _lines.append(f"  P10:    {np.percentile(_sigma, 10):.6f}")
+        _lines.append(f"  P70:    {np.percentile(_sigma, 70):.6f}")
+        _lines.append(f"  P90:    {np.percentile(_sigma, 90):.6f}")
+        _lines.append(f"  --- Price-space (sigma * mid) ---")
+        _lines.append(f"  Mean:   {np.mean(_sigma_price):.2f}")
+        _lines.append(f"  Median: {np.median(_sigma_price):.2f}")
+        _lines.append(f"  Avg mid price: {_avg_mid:.2f}")
+        _lines.append(f"  AC(1):  {_ac1:.4f}")
+        _lines.append("```\n")
+
+    mo.md("\n".join(_lines))
+    return
+
+
+# ---------------------------------------------------------------------------
+# Cell 8: Spread diagnostics display
+# ---------------------------------------------------------------------------
+@app.cell
+def spread_diag(mo, np, SYMBOLS, datasets, as_optimal_spread):
+    _lines = ["## Spread Diagnostics (at median vol, tau=0.5)\n"]
+
+    for _sym in SYMBOLS:
+        _train = datasets[_sym]["train"]
+        _median_sigma = float(np.median(_train["rvol_24h"].to_numpy()))
+        _median_mid = float(np.median(_train["mid"].to_numpy()))
+
+        _lines.append(f"### {_sym} (mid={_median_mid:.2f}, sigma_ret={_median_sigma:.6f})")
+        _lines.append("```")
+        _lines.append(f"  {'gamma':>8} {'kappa':>8} {'T':>4} {'tau':>6} | {'spread':>10} {'spread_bp':>10}")
+        _lines.append(f"  {'-'*60}")
+        for _gamma in [0.01, 0.1, 1.0, 10.0]:
+            for _kappa in [0.5, 1.0, 5.0]:
+                for _T in [8, 24]:
+                    _sigma_price = _median_sigma * _median_mid
+                    _tau = 0.5
+                    _spread = as_optimal_spread(_gamma, _sigma_price, _tau, _kappa)
+                    _spread_bp = _spread / _median_mid * 10000
+                    _lines.append(
+                        f"  {_gamma:8.2f} {_kappa:8.2f} {_T:4d} {_tau:6.2f} | "
+                        f"{_spread:10.4f} {_spread_bp:9.1f}bp"
+                    )
+        _lines.append("```\n")
+
+    mo.md("\n".join(_lines))
+    return
+
+
+# ---------------------------------------------------------------------------
+# Cell 9: Grid search
+# ---------------------------------------------------------------------------
+@app.cell
+def grid_search_cell(
+    mo,
+    np,
+    itertools,
+    SYMBOLS,
+    datasets,
+    run_simulation,
+    compute_metrics,
+):
+    def grid_search_as(train_df, test_df, symbol):
+        """Run parameter grid search for AS model on train, evaluate best on test."""
+        _gammas = [0.01, 0.1, 1.0, 10.0]
+        _kappas = [0.5, 1.0, 2.0, 5.0]
+        _T_hours_list = [8, 24]
+        _inv_limits = [5, 10, 20]
+
+        _initial_price_train = train_df["close"][0]
+        _initial_price_test = test_df["close"][0]
+
+        _header_lines = [
+            f"### GRID SEARCH: {symbol} -- AS Naive Model",
+            f"Train: {len(train_df)} bars, Test: {len(test_df)} bars\n",
+            "```",
+            f"{'gamma':>8} {'kappa':>8} {'T':>4} {'inv_lim':>8} | "
+            f"{'Sharpe':>8} {'PnL(bps)':>10} {'MaxDD%':>8} {'Fills':>7} "
+            f"{'Both%':>7} {'None%':>7} {'AvgSprd':>8} {'AvgInv':>7}",
+            "-" * 110,
         ]
 
-        print(f"    {'Strategy':<16} {'Sharpe':>8} {'PnL(bps)':>10} {'MaxDD%':>8} "
-              f"{'Fills':>7} {'AvgSprd':>8} {'AvgInv':>7}")
-        for name, kwargs in configs:
-            state = run_simulation(test_df, **kwargs)
-            m = compute_metrics(state, initial_price)
-            print(f"    {name:<16} {m.sharpe:8.2f} {m.total_pnl_bps:10.1f} {m.max_drawdown_pct:8.2f} "
-                  f"{m.total_fills:7d} {m.avg_spread_bps:7.1f}bp {m.avg_abs_inventory:6.1f}")
+        _results = []
+        _detail_lines = []
 
-    print(f"\n{'='*110}")
-    print("  KEY TAKEAWAYS")
-    print(f"{'='*110}")
-    print("""
-  1. AS MODEL with price-space sigma (sigma_price = rvol_24h * mid):
-     - Converts hourly return vol into dollar-denominated spread
-     - Low gamma + low kappa => wide spread, few fills, large inventory accumulation
-     - High gamma + high kappa => tighter spread, more fills, better inventory control
+        for _gamma, _kappa, _T_hours, _inv_limit in itertools.product(
+            _gammas, _kappas, _T_hours_list, _inv_limits
+        ):
+            _state = run_simulation(
+                train_df,
+                strategy="as_naive",
+                gamma=_gamma,
+                kappa=_kappa,
+                T_hours=_T_hours,
+                inv_limit=_inv_limit,
+            )
+            _m = compute_metrics(_state, _initial_price_train)
+            _results.append((_gamma, _kappa, _T_hours, _inv_limit, _m))
 
-  2. INVENTORY SKEW (reservation price shift):
-     - q * gamma * sigma^2 * tau shifts the mid to favor reducing inventory
-     - Effective only when gamma * sigma_price^2 is meaningful relative to spread
+            _detail_lines.append(
+                f"{_gamma:8.2f} {_kappa:8.2f} {_T_hours:4d} {_inv_limit:8d} | "
+                f"{_m.sharpe:8.2f} {_m.total_pnl_bps:10.1f} {_m.max_drawdown_pct:8.2f} "
+                f"{_m.total_fills:7d} {_m.fill_rate_both*100:6.1f}% {_m.fill_rate_none*100:6.1f}% "
+                f"{_m.avg_spread_bps:7.1f}bp {_m.avg_abs_inventory:6.1f}"
+            )
 
-  3. REGIME-AWARE (3x gamma in high vol):
-     - Widens spreads when vol > P70, reducing adverse selection risk
-     - Incremental improvement over naive AS in volatile periods
+        _results.sort(key=lambda x: x[4].sharpe, reverse=True)
 
-  4. FIXED SPREAD baseline:
-     - 50bp: high fill rate, moderate inventory risk
-     - 100bp: lower fill rate, less adverse selection
-     - Simple but surprisingly competitive on 1h data
+        _top_lines = [
+            "```\n",
+            f"#### TOP 10 CONFIGS by Sharpe (Train) -- {symbol}\n",
+            "```",
+        ]
+        for _rank, (_gamma, _kappa, _T_hours, _inv_limit, _m) in enumerate(_results[:10], 1):
+            _top_lines.append(f"  #{_rank}: gamma={_gamma}, kappa={_kappa}, T={_T_hours}h, inv_limit={_inv_limit}")
+            _top_lines.append(
+                f"       Sharpe={_m.sharpe:.3f}, PnL={_m.total_pnl_bps:.1f}bps, "
+                f"MaxDD={_m.max_drawdown_pct:.2f}%, Fills={_m.total_fills}, "
+                f"AvgSpread={_m.avg_spread_bps:.1f}bp, AvgInv={_m.avg_abs_inventory:.1f}"
+            )
 
-  5. LIMITATIONS of 1h OHLCV simulation:
-     - Fill logic: bid filled if next_low <= bid (optimistic, ignores queue position)
-     - No intra-hour microstructure or adverse selection modelling
-     - Both sides can fill in same bar (optimistic for round-trip capture)
-     - Real MM would face: partial fills, latency, queue priority, toxic flow
-     - Results are UPPER BOUND on realistic MM performance
-    """)
+        _test_lines = [
+            "```\n",
+            f"#### TEST EVALUATION -- Top 5 configs -- {symbol}\n",
+            "```",
+        ]
+        for _rank, (_gamma, _kappa, _T_hours, _inv_limit, _train_m) in enumerate(_results[:5], 1):
+            _state_test = run_simulation(
+                test_df,
+                strategy="as_naive",
+                gamma=_gamma,
+                kappa=_kappa,
+                T_hours=_T_hours,
+                inv_limit=_inv_limit,
+            )
+            _mt = compute_metrics(_state_test, _initial_price_test)
+            _test_lines.append(f"  #{_rank}: gamma={_gamma}, kappa={_kappa}, T={_T_hours}h, inv_limit={_inv_limit}")
+            _test_lines.append(f"       [Train] Sharpe={_train_m.sharpe:.3f}, PnL={_train_m.total_pnl_bps:.1f}bps")
+            _test_lines.append(
+                f"       [Test]  Sharpe={_mt.sharpe:.3f}, PnL={_mt.total_pnl_bps:.1f}bps, "
+                f"MaxDD={_mt.max_drawdown_pct:.2f}%, Fills={_mt.total_fills}, "
+                f"AvgSpread={_mt.avg_spread_bps:.1f}bp, AvgInv={_mt.avg_abs_inventory:.1f}, "
+                f"PnL/Fill={_mt.pnl_per_fill:.4f}"
+            )
+        _test_lines.append("```")
+
+        _all_lines = _header_lines + _detail_lines + _top_lines + _test_lines
+        return _results, "\n".join(_all_lines)
+
+    _output_parts = ["## Grid Search Results\n"]
+    all_best_configs = {}
+
+    for _sym in SYMBOLS:
+        _d = datasets[_sym]
+        _results, _text = grid_search_as(_d["train"], _d["test"], _sym)
+        _output_parts.append(_text)
+
+        _best = _results[0]
+        all_best_configs[_sym] = {
+            "gamma": _best[0],
+            "kappa": _best[1],
+            "T_hours": _best[2],
+            "inv_limit": _best[3],
+        }
+
+    mo.md("\n\n".join(_output_parts))
+    return (all_best_configs,)
+
+
+# ---------------------------------------------------------------------------
+# Cell 10: Strategy comparison
+# ---------------------------------------------------------------------------
+@app.cell
+def strategy_comparison(
+    mo,
+    np,
+    pl,
+    SYMBOLS,
+    TRAIN_CUTOFF,
+    datasets,
+    all_best_configs,
+    run_simulation,
+    compute_metrics,
+):
+    _output_parts = ["## Strategy Comparison (Test Set)\n"]
+
+    for _sym in SYMBOLS:
+        _d = datasets[_sym]
+        _test_df = _d["test"]
+        _train_df = _d["train"]
+        _initial_price = _test_df["close"][0]
+        _cfg = all_best_configs[_sym]
+        _g, _k, _t, _inv = _cfg["gamma"], _cfg["kappa"], _cfg["T_hours"], _cfg["inv_limit"]
+
+        _vol_p70 = float(_train_df["rvol_24h"].quantile(0.70))
+
+        _strategies = [
+            ("Fixed 50bp", dict(strategy="fixed", fixed_spread_bps=50.0, inv_limit=_inv)),
+            ("Fixed 100bp", dict(strategy="fixed", fixed_spread_bps=100.0, inv_limit=_inv)),
+            ("AS Naive", dict(
+                strategy="as_naive", gamma=_g, kappa=_k,
+                T_hours=_t, inv_limit=_inv,
+            )),
+            ("AS Regime-Aware", dict(
+                strategy="as_regime", gamma=_g, kappa=_k,
+                T_hours=_t, inv_limit=_inv,
+                regime_aware=True, vol_percentile_70=_vol_p70,
+            )),
+        ]
+
+        _lines = [
+            f"### {_sym}",
+            f"Best AS params: gamma={_g}, kappa={_k}, T={_t}h, inv_limit={_inv}",
+            f"Vol P70 threshold: {_vol_p70:.6f}\n",
+            "```",
+            f"{'Strategy':<20} | {'Sharpe':>8} {'PnL(bps)':>10} {'MaxDD%':>8} "
+            f"{'Fills':>7} {'Both%':>7} {'None%':>7} {'AvgSprd':>8} "
+            f"{'AvgInv':>7} {'PnL/Fill':>10} {'FinalInv':>9}",
+            "-" * 120,
+        ]
+
+        for _name, _kwargs in _strategies:
+            _state = run_simulation(_test_df, **_kwargs)
+            _m = compute_metrics(_state, _initial_price)
+            _lines.append(
+                f"{_name:<20} | {_m.sharpe:8.2f} {_m.total_pnl_bps:10.1f} {_m.max_drawdown_pct:8.2f} "
+                f"{_m.total_fills:7d} {_m.fill_rate_both*100:6.1f}% {_m.fill_rate_none*100:6.1f}% "
+                f"{_m.avg_spread_bps:7.1f}bp {_m.avg_abs_inventory:6.1f} "
+                f"{_m.pnl_per_fill:10.4f} {_state.inventory:9.1f}"
+            )
+
+        _lines.append("```\n")
+        _output_parts.append("\n".join(_lines))
+
+    mo.md("\n\n".join(_output_parts))
+    return
+
+
+# ---------------------------------------------------------------------------
+# Cell 11: Detailed monthly breakdown
+# ---------------------------------------------------------------------------
+@app.cell
+def monthly_breakdown(
+    mo,
+    np,
+    SYMBOLS,
+    datasets,
+    all_best_configs,
+    run_simulation,
+):
+    _output_parts = ["## Detailed Monthly Breakdown (Full Dataset)\n"]
+
+    for _sym in SYMBOLS:
+        _d = datasets[_sym]
+        _df = _d["full"]
+        _cfg = all_best_configs[_sym]
+        _gamma, _kappa, _T_hours, _inv_limit = (
+            _cfg["gamma"], _cfg["kappa"], _cfg["T_hours"], _cfg["inv_limit"]
+        )
+
+        _state = run_simulation(
+            _df, strategy="as_naive",
+            gamma=_gamma, kappa=_kappa, T_hours=_T_hours, inv_limit=_inv_limit,
+        )
+
+        _timestamps = _df["timestamp"].to_list()
+        _closes = _df["close"].to_numpy()
+        _initial_price = _closes[0]
+        _pnl_arr = np.array(_state.pnl_history)
+        _inv_arr = np.array(_state.inventory_history)
+        _spread_arr = np.array(_state.spread_history)
+
+        _monthly = {}
+        _n = len(_pnl_arr)
+        for _i in range(_n):
+            _month_key = _timestamps[_i].strftime("%Y-%m")
+            if _month_key not in _monthly:
+                _monthly[_month_key] = {"n": 0, "start_idx": _i, "end_idx": _i}
+            _monthly[_month_key]["n"] += 1
+            _monthly[_month_key]["end_idx"] = _i
+
+        _lines = [
+            f"### {_sym}",
+            f"gamma={_gamma}, kappa={_kappa}, T={_T_hours}h, inv_limit={_inv_limit}\n",
+            "```",
+            f"{'Month':<10} | {'Bars':>5} {'AvgInv':>7} {'MaxInv':>7} "
+            f"{'AvgSprd':>8} {'MonthPnL':>12} {'CumPnL':>12} {'CumBps':>9}",
+            "-" * 90,
+        ]
+
+        _sorted_months = sorted(_monthly.keys())
+        for _month in _sorted_months:
+            _md = _monthly[_month]
+            _si, _ei = _md["start_idx"], _md["end_idx"]
+            _month_inv = _inv_arr[_si:_ei+1]
+            _month_spread = _spread_arr[_si:_ei+1]
+            _month_pnl_start = _pnl_arr[_si - 1] if _si > 0 else 0.0
+            _month_pnl_end = _pnl_arr[_ei]
+            _month_pnl = _month_pnl_end - _month_pnl_start
+            _cum_pnl_bps = _month_pnl_end / _initial_price * 10000.0
+
+            _lines.append(
+                f"{_month:<10} | {_md['n']:5d} {np.mean(np.abs(_month_inv)):6.1f} "
+                f"{np.max(np.abs(_month_inv)):7.1f} {np.mean(_month_spread):7.1f}bp "
+                f"{_month_pnl:12.2f} {_month_pnl_end:12.2f} {_cum_pnl_bps:8.1f}bp"
+            )
+
+        _lines.append("")
+        _lines.append(f"  Full-period inventory stats:")
+        _lines.append(f"    Mean absolute: {np.mean(np.abs(_inv_arr)):.2f}")
+        _lines.append(f"    Max absolute:  {np.max(np.abs(_inv_arr)):.2f}")
+        _lines.append(f"    Std:           {np.std(_inv_arr):.2f}")
+        _lines.append(f"    Final:         {_state.inventory:.1f}")
+        _lines.append(f"    Final PnL:     {_pnl_arr[-1]:.2f} ({_pnl_arr[-1]/_initial_price*10000:.1f} bps)")
+        _lines.append(f"  Full-period spread stats:")
+        _lines.append(f"    Mean:   {np.mean(_spread_arr):.1f} bp")
+        _lines.append(f"    Median: {np.median(_spread_arr):.1f} bp")
+        _lines.append(f"    P10:    {np.percentile(_spread_arr, 10):.1f} bp")
+        _lines.append(f"    P90:    {np.percentile(_spread_arr, 90):.1f} bp")
+        _lines.append(f"  Fill stats:")
+        _lines.append(f"    Bid fills:  {_state.n_bid_fills}")
+        _lines.append(f"    Ask fills:  {_state.n_ask_fills}")
+        _lines.append(f"    Both:       {_state.n_both_fills} ({_state.n_both_fills/_state.n_periods*100:.1f}%)")
+        _lines.append(f"    None:       {_state.n_no_fills} ({_state.n_no_fills/_state.n_periods*100:.1f}%)")
+        _lines.append("```\n")
+        _output_parts.append("\n".join(_lines))
+
+    mo.md("\n\n".join(_output_parts))
+    return
+
+
+# ---------------------------------------------------------------------------
+# Cell 12: Summary and key takeaways
+# ---------------------------------------------------------------------------
+@app.cell
+def summary_cell(
+    mo,
+    np,
+    pl,
+    SYMBOLS,
+    TRAIN_CUTOFF,
+    datasets,
+    all_best_configs,
+    run_simulation,
+    compute_metrics,
+):
+    _output_parts = ["## Final Summary\n"]
+
+    for _sym in SYMBOLS:
+        _d = datasets[_sym]
+        _test_df = _d["test"]
+        _train_df = _d["train"]
+        _initial_price = _test_df["close"][0]
+        _cfg = all_best_configs[_sym]
+        _g, _k, _t, _inv = _cfg["gamma"], _cfg["kappa"], _cfg["T_hours"], _cfg["inv_limit"]
+
+        _vol_p70 = float(_train_df["rvol_24h"].quantile(0.70))
+
+        _configs = [
+            ("Fixed 50bp", dict(strategy="fixed", fixed_spread_bps=50.0, inv_limit=_inv)),
+            ("Fixed 100bp", dict(strategy="fixed", fixed_spread_bps=100.0, inv_limit=_inv)),
+            ("AS Naive", dict(strategy="as_naive", gamma=_g, kappa=_k, T_hours=_t, inv_limit=_inv)),
+            ("AS Regime", dict(strategy="as_regime", gamma=_g, kappa=_k, T_hours=_t, inv_limit=_inv,
+                               regime_aware=True, vol_percentile_70=_vol_p70)),
+        ]
+
+        _lines = [
+            f"### {_sym}",
+            f"Best config: gamma={_g}, kappa={_k}, T={_t}h, inv_limit={_inv}\n",
+            "```",
+            f"  {'Strategy':<16} {'Sharpe':>8} {'PnL(bps)':>10} {'MaxDD%':>8} "
+            f"{'Fills':>7} {'AvgSprd':>8} {'AvgInv':>7}",
+        ]
+
+        for _name, _kwargs in _configs:
+            _state = run_simulation(_test_df, **_kwargs)
+            _m = compute_metrics(_state, _initial_price)
+            _lines.append(
+                f"  {_name:<16} {_m.sharpe:8.2f} {_m.total_pnl_bps:10.1f} {_m.max_drawdown_pct:8.2f} "
+                f"{_m.total_fills:7d} {_m.avg_spread_bps:7.1f}bp {_m.avg_abs_inventory:6.1f}"
+            )
+
+        _lines.append("```\n")
+        _output_parts.append("\n".join(_lines))
+
+    _takeaways = """
+## Key Takeaways
+
+1. **AS MODEL with price-space sigma** (sigma_price = rvol_24h * mid):
+   - Converts hourly return vol into dollar-denominated spread
+   - Low gamma + low kappa => wide spread, few fills, large inventory accumulation
+   - High gamma + high kappa => tighter spread, more fills, better inventory control
+
+2. **INVENTORY SKEW** (reservation price shift):
+   - q * gamma * sigma^2 * tau shifts the mid to favor reducing inventory
+   - Effective only when gamma * sigma_price^2 is meaningful relative to spread
+
+3. **REGIME-AWARE** (3x gamma in high vol):
+   - Widens spreads when vol > P70, reducing adverse selection risk
+   - Incremental improvement over naive AS in volatile periods
+
+4. **FIXED SPREAD baseline**:
+   - 50bp: high fill rate, moderate inventory risk
+   - 100bp: lower fill rate, less adverse selection
+   - Simple but surprisingly competitive on 1h data
+
+5. **LIMITATIONS of 1h OHLCV simulation**:
+   - Fill logic: bid filled if next_low <= bid (optimistic, ignores queue position)
+   - No intra-hour microstructure or adverse selection modelling
+   - Both sides can fill in same bar (optimistic for round-trip capture)
+   - Real MM would face: partial fills, latency, queue priority, toxic flow
+   - Results are UPPER BOUND on realistic MM performance
+"""
+
+    _output_parts.append(_takeaways)
+    mo.md("\n".join(_output_parts))
+    return
 
 
 if __name__ == "__main__":
-    main()
+    app.run()
