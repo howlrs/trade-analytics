@@ -9,6 +9,11 @@
 
 ---
 
+## 検証規模
+- **22手法** × 複数パラメータ × 複数ホライズン × 4通貨 = 数百の仮説検定
+- 全手法でTrain/Test分割 + Walk-Forward CV + 重複排除
+- Newey-West HAC, Bonferroni補正, Spearman順位相関を適用
+
 ## 検証した手法と結果
 
 ### 1. OHLCV 線形アルファ (#9)
@@ -153,9 +158,93 @@ FR/OI閾値ベースのイベント分析。Train有意 → Test崩壊。
 
 ---
 
+### 13. イベント駆動リバーサル (2σ/3σ)
+
+- Crash/Pump後の4hリバーサル: Train/Testで符号不安定
+- 2σ: ETH Test Crash fwd_4h=+12bp (非有意), Pump=-8bp
+- 3σ: N < 5 で検定不可能なケース多数
+
+### 14. MA乖離ミーンリバージョン (24h MA)
+
+- Q1-Q5 spread: 1-9bp (実質ゼロ)
+- ETH/SOL共にTrain/Testで微弱
+
+### 15. XS Composite Walk-Forward (Basis+FR)
+
+- Walk-Forward: 9 fold, mean=26bp/day
+- Sharpe=1.77, **p=0.11** (非有意だが最も有望)
+- コスト控除後: 22bp/day
+- 課題: fold間の分散が大
+
+### 16. MM-Specific Alpha探索
+
+| シグナル | 結果 | 判定 |
+|---------|------|------|
+| Cross-Exchange Lead-Lag (Bin↔Byb) | r=0.01-0.03 | 無効 |
+| Volume Imbalance → Direction | r=0.01-0.06 | 無効 |
+| OI Change → Direction | r=-0.01 to -0.03 | 無効 |
+| FR Settlement Timing | Train/Test符号反転 | FAIL |
+| Adverse Selection (50bp) | -0〜-2bp (微小) | 構造的 |
+
+### 17. Avellaneda-Stoikov MMモデル
+
+- 1h足OHLCVでは全構成でマイナスリターン
+- ASモデルの動的スプレッドは定数項 `(2/γ)×ln(1+γ/κ)` に支配される
+- Fixed 50bpが最良 (SOL Test Sharpe=1.46)
+- **Tick/LOBデータなしでは本来の価値を発揮できない**
+
+### 18. FR/Basis Carry戦略
+
+| 戦略 | 概要 | Train | Test | 判定 |
+|------|------|-------|------|------|
+| Simple FR Carry | FR>0でロング | -2.7〜-24.6bp | -10.7〜-35.0bp | FAIL |
+| Basis Carry 8h | Basis>0でショート | ETH +25bp(p=0.07) | ETH -11bp(p=0.34) | FAIL (符号反転) |
+| FR Carry + VolAdj | vol調整 | 微改善 | 同等にマイナス | FAIL |
+
+**敗因**: FR収入(0.5-0.9bp/8h)がコスト(8bp往復)と方向リスクを大幅に下回る。
+
+### 19. ペアトレード
+
+| ペア | Cointegration p | Half-Life (Test) | Backtest | 判定 |
+|------|----------------|-----------------|----------|------|
+| ETH/BTC | 0.969 | 1220h | Train/Test符号反転 | FAIL |
+| SOL/ETH | 0.166 | 4584h | Train/Test符号反転 | FAIL |
+| SOL/BTC | 0.366 | 1359h | ≈0bp | FAIL |
+
+**敗因**: コインテグレーション不成立、半減期が長すぎる(1000h+)。
+
+### 20. カレンダー効果
+
+| パターン | Train | Test | 判定 |
+|---------|-------|------|------|
+| 月末効果 (28-31日) | -2.8〜-4.4bp | -2.6〜-5.1bp | 一致だが微弱 |
+| 月初効果 (1-3日) | -3.5〜+1.8bp | +1.6〜+3.0bp | 不安定 |
+| Hour 21 UTC (ETH) | +10.5bp (p=0.08) | +8.8bp (p=0.03) | 要Bonferroni |
+| Options Expiry | range 1.05-1.07x | - | 微小 |
+
+24時間 × 2トークン = 48検定 → Bonferroni補正で全て非有意。
+
+### 21. 条件付きMM (時間帯×ボラレジーム)
+
+全7パターン (all_hours, us_hours, us_weekday, ±vol_regime) でTest全てマイナス。
+SOL vol_adaptive: Train +12bp → Test -34bp (過適合の典型例)。
+
+### 22. FR Level → 7d Forward (Linear, Non-overlapping)
+
+| トークン | Train r | Test r | WF mean | 判定 |
+|---------|---------|--------|---------|------|
+| BTC | -0.280 | +0.082 (p=0.70) | -81bp | FAIL (符号反転) |
+| ETH | -0.016 | -0.143 (p=0.49) | -61bp | FAIL |
+| SOL | -0.252 | -0.155 (p=0.46) | -77bp | FAIL |
+
+Cumulative FR (7d sum) も全て非有意 (p>0.42)。
+Spearman順位相関でもBTC Test r=0.025 (完全に無相関)。
+
+---
+
 ## 堅牢な正の知見
 
-以下はアルファではないが、リスク管理に有用:
+以下はアルファではないが、リスク管理・MM運用に有用:
 
 1. **ボラティリティ・クラスタリング**: 自己相関 lag=1h で r=0.98, lag=24hで r=0.30-0.49
 2. **レジーム持続性**: 低/高ボラ区間は平均18-24h持続
@@ -163,6 +252,14 @@ FR/OI閾値ベースのイベント分析。Train有意 → Test崩壊。
 4. **ボラ圧縮 → 継続低ボラ**: ブレイクアウトではなく継続 (ポジションサイジングに有用)
 5. **DEX Volume は価格と独立**: 将来のデータソースとして有望だが、現時点では予測力不足
 6. **ナイーブボラ予測が最良**: 現在のボラ ≈ 将来のボラ (MLモデルを上回る)
+7. **時間帯パターン**: 13-16 UTC が最大レンジ (150-180bp), 04-06 UTC が最小 (73-100bp) — Train/Test完全一致
+8. **週末効果**: 週末range = 平日の63-78% — Train/Test完全一致
+9. **Volume→Range予測**: vol_ratio→next_range r=0.28-0.29 (Train/Test一致)
+10. **クロスアセット相関安定**: BTC-ETH r=0.82, BTC-SOL r=0.79 — ヘッジに有用
+11. **Vol変化のミーンリバージョン**: past_vol_chg→future_vol_chg r=-0.27〜-0.37 (Train/Test一致)
+12. **極端イベント・クラスタリング**: P(|z|>2 | prev>2)=3.1x, P(|z|>3 | prev>3)=5.2-6.3x
+13. **テール分布**: kurtosis=11.6-17.7 (fat tail), 1% VaR: BTC -148bp, ETH -222bp, SOL -246bp
+14. **ポジションサイジング効果**: Vol-adjusted MaxDD 55-68%削減、Extreme-aware DD 29-43%追加削減
 
 ---
 
@@ -171,6 +268,7 @@ FR/OI閾値ベースのイベント分析。Train有意 → Test崩壊。
 ### 現データでの結論
 **1年分のOHLCV + デリバティブ + オンチェーンマクロデータでは、
 4トークン (BTC/ETH/SOL/SUI) の方向性アルファは統計的に頑健な水準で検出できない。**
+**1h足OHLCVデータでのMM戦略も全シミュレーションで平均リターンがマイナス。**
 
 これは「アルファが存在しない」ことの証明ではなく、
 「このデータセットとツールセットでは検出できない」ことを意味する。
@@ -180,9 +278,15 @@ FR/OI閾値ベースのイベント分析。Train有意 → Test崩壊。
   - ナイーブボラ予測 (r=0.49) を活用したリスクパリティ
   - 既存の裁量トレードのリスク管理改善
   - ボラ・クラスタリングを活用した動的レバレッジ
+- **MM時間帯最適化**
+  - 13-16 UTC にMM活動を集中 (range 2x)
+  - 週末はスプレッド拡大またはポジション縮小
+- **XS Composite (Basis+FR)の継続監視**
+  - Walk-Forward Sharpe=1.77 (p=0.11) は非有意だが最も有望
+  - 追加データ蓄積で統計検出力向上の可能性
 
 ### 中期的 (追加データ必要)
-- **高頻度データ**: Tick level, LOB depth → マイクロストラクチャーシグナル
+- **高頻度データ**: Tick level, LOB depth → マイクロストラクチャーシグナル、ASモデルの真価
 - **清算データ**: Coinglass API → 清算カスケードの事前検出
 - **オンチェーンフロー**: Glassnode (Exchange Flow, MVRV) → 大口の動き
 - **より長い履歴**: 3-5年分のデータで weekly/monthly シグナルの検出力向上
@@ -191,3 +295,4 @@ FR/OI閾値ベースのイベント分析。Train有意 → Test崩壊。
 - 連続的シグナル生成 → **特定イベント検出** (清算カスケード、急騰急落)
 - 方向予測 → **ボラティリティ取引** (DEX/CEXのオプション・パーペチュアル)
 - 単一市場 → **クロスマーケット** (CEX-DEX裁定, MEV)
+- 1h足MM → **Tick/LOBベースのMM** (ASモデルが真に機能する粒度)
