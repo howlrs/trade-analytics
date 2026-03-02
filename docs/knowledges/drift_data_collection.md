@@ -84,8 +84,39 @@ mkdir -p logs
 - **逆選択の実測**: 1週間以上（CEX-DEX divergence と約定の相関）
 - **MM戦略パラメータ設計**: 2週間以上（レジーム変動を含む十分なサンプル）
 
+## ヒストリカルデータ取得 (`scripts/fetch_drift_historical.py`)
+
+Data API の日別エンドポイントで過去データをバルク取得。
+
+```bash
+# 全種類一括取得
+python scripts/fetch_drift_historical.py --all --start 2023-01-01
+
+# 個別取得
+python scripts/fetch_drift_historical.py --type candles --start 2022-11-15
+python scripts/fetch_drift_historical.py --type funding --start 2023-01-01
+python scripts/fetch_drift_historical.py --type trades --start 2023-01-01
+```
+
+### 取得済みデータ（2026-03-02時点）
+
+| データ | ファイル | 行数 | サイズ | 期間 |
+|--------|---------|------|--------|------|
+| Candles 1h | `drift_sol_perp_candles_1h.parquet` | 28,841 | 1.5 MB | 2022-11-15 ~ |
+| Funding Rates | `drift_sol_perp_funding_rates.parquet` | 27,700 | 1.1 MB | 2023-01-01 ~ |
+| Trades | `drift_sol_perp_trades_historical.parquet` | 6,220,037 | 540 MB | 2023-01-01 ~ |
+
+### 注意事項
+- Trades の日別CSVは1日最大10,000件（5000件/page × 2 pages）。出来高の大きい日は全件取得不可
+- Candles API の `startTs` はカーソルとして動作（その時点**以前**のデータを返す）
+- スクリプトはレジューム対応（既存ファイルに含まれる日付はスキップ）
+- Funding Rates の日別は `format=json`（CSV未対応の日あり）
+
 ## API 仕様メモ
 
 - **DLOB L2 API**: `https://dlob.drift.trade/l2` — リアルタイム板情報（REST）
 - **Data API trades**: `https://data.api.drift.trade/market/{symbol}/trades` — 約定履歴（直近31日、50件/page）
+- **Data API trades (日別)**: `https://data.api.drift.trade/market/{symbol}/trades/{year}/{month}/{day}` — 過去データ（format=csv推奨、5000件/page × 2 pages）
+- **Data API candles**: `https://data.api.drift.trade/market/{symbol}/candles/{resolution}` — OHLCV（1/5/15/60/240/D/W/M分足）
+- **Data API fundingRates (日別)**: `https://data.api.drift.trade/market/{symbol}/fundingRates/{year}/{month}/{day}`
 - **旧 DLOB /trades エンドポイント**: 廃止済み（404）→ Data API に移行
