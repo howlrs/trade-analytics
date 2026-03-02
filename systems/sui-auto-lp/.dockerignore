@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+*.log
+logs/
+.sui/
+.git/
+.claude/
+deploy/
+scripts/

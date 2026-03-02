@@ -1,0 +1,33 @@
+[Unit]
+Description=Sui Auto LP - Cetus CLMM Liquidity Optimizer
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sui-bot
+Group=sui-bot
+WorkingDirectory=/opt/sui-auto-lp
+ExecStart=/usr/bin/node /opt/sui-auto-lp/dist/index.js
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sui-auto-lp
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=80%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sui-auto-lp
+
+[Install]
+WantedBy=multi-user.target
