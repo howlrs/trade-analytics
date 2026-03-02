@@ -1,0 +1,41 @@
+{
+  "name": "sui-auto-lp",
+  "version": "0.1.0",
+  "description": "Automated LP optimization for Cetus CLMM pools on Sui",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "type-check": "tsc --noEmit",
+    "report": "tsx scripts/daily-report.ts",
+    "report:all": "tsx scripts/daily-report.ts --all",
+    "health": "tsx scripts/health-check.ts",
+    "health:verbose": "tsx scripts/health-check.ts --verbose",
+    "health:json": "tsx scripts/health-check.ts --json",
+    "deepbook": "tsx scripts/check-deepbook.ts",
+    "deepbook:long": "tsx scripts/open-deepbook-long.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@cetusprotocol/aggregator-sdk": "^1.4.5",
+    "@cetusprotocol/cetus-sui-clmm-sdk": "^5.4.0",
+    "@mysten/deepbook-v3": "^0.28.3",
+    "@mysten/sui": "^1.21.1",
+    "dotenv": "^16.4.7",
+    "node-cron": "^3.0.3",
+    "tslib": "^2.8.1",
+    "winston": "^3.17.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/node-cron": "^3.0.11",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.18"
+  }
+}
