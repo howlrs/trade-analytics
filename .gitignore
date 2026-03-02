@@ -44,3 +44,4 @@ Thumbs.db
 
 # Claude sessions (may contain sensitive context)
 docs/sessions/
+__marimo__/
