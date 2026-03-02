@@ -49,6 +49,8 @@ class MMConfig:
     momentum_window: int = 4      # hours for momentum signal
     vol_surprise_window: int = 24  # hours for volume surprise
     vol_surprise_threshold: float = 2.0  # z-score threshold
+    regime_filter: bool = False    # enable 7d-return regime filter
+    regime_threshold: float = -0.05  # skip quoting when 7d return below this
 
 
 @dataclass
@@ -126,6 +128,10 @@ class PaperTrader:
         else:
             vol_surprise = 0.0
 
+        # --- 7d return (regime filter) ---
+        ret_7d_start = max(0, i - 168)
+        ret_7d = (close[i] / close[ret_7d_start] - 1.0) if close[ret_7d_start] > 0 else 0.0
+
         return {
             "rvol": rvol,
             "vov": vov,
@@ -133,6 +139,7 @@ class PaperTrader:
             "momentum": momentum,
             "hour": h,
             "vol_surprise": vol_surprise,
+            "ret_7d": ret_7d,
         }
 
     # ---- quote computation ----
@@ -271,6 +278,17 @@ class PaperTrader:
 
             # Compute features
             features = self.compute_features(i, close, fr, binance_vol, hour)
+
+            # Regime filter: skip quoting in bearish regimes
+            if cfg.regime_filter and features["ret_7d"] < cfg.regime_threshold:
+                # Still apply funding and record state, but don't quote
+                self.apply_funding(fr[i + 1], close[i + 1])
+                mtm = st.cash + st.inventory * close[i + 1]
+                st.mark_to_market.append(mtm)
+                st.pnl_history.append(mtm)
+                st.inventory_history.append(st.inventory)
+                st.timestamps.append(timestamps[i + 1])
+                continue
 
             # Compute quotes
             bid, ask = self.compute_quotes(features, mid)
@@ -543,6 +561,12 @@ def main():
         ("Aggressive",
          MMConfig(gamma=0.05, fr_alpha=2.0, momentum_skew=0.4,
                   inv_limit=15, base_size=2.0)),
+        ("Tight Inv (γ=0.12,q=2)",
+         MMConfig(gamma=0.12, inv_limit=2, fr_alpha=0.0, momentum_skew=0.0)),
+        ("Tight Inv (γ=0.1,q=3)",
+         MMConfig(gamma=0.1, inv_limit=3, fr_alpha=0.0, momentum_skew=0.0)),
+        ("Tight + FR + Mom",
+         MMConfig(gamma=0.12, inv_limit=2, fr_alpha=1.0, momentum_skew=0.3)),
     ]
 
     print("=" * 100)
