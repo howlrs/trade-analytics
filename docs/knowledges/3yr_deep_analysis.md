@@ -240,27 +240,41 @@ IF rvol_24h > trailing_90d_median:
 
 ## 9. FR-Biased Inventory 戦略
 
-### Drift FR 構造的プレミアム
+### Drift FR 構造的プレミアム（修正済み）
 
-- Drift 累積8h FR: 平均 +1.32%（Bybitの0.006%と比較して桁違い）
-- FR divergence: 平均 +1.31% per 8h = **14.36% APR**
+**重要: Drift FRはprice units (USD/base/hour)で格納。正しい変換: `fr_pct = funding_rate / oracle_price_twap`**
+
+- Drift hourly FR: 平均 +0.00149%/hr = **13.0% APR**
+- Bybit 8h FR: 平均 +0.0023%/8h = **2.5% APR**
+- Drift 8h換算: +0.012%/8h → **Bybitの5.4倍**（DEXのワイドスプレッドに起因）
 - 高持続性: AC=0.85 (8h), AC=0.51 (1w)
-- 極端値からは平均回帰 (P90→次期間 -0.94%, t=-3.65)
+- 正のFR: 全時間の63%（long pays short が支配的）
 
-### FR-Biased MM Backtest結果
+### FR-Biased MM Paper Trader結果（3年バックテスト、修正後）
 
-reservation_price に FR bias を追加:
-`r = mid - q*gamma*sigma²*tau + alpha * FR_EMA(8h)`
+FR修正後のペーパートレーダー結果:
 
-| alpha | Sharpe | Total PnL | MaxDD |
-|-------|--------|-----------|-------|
-| 0 | 0.00 | 0.00 | — |
-| 50 | 0.72 | 108.32 | -58.15 |
-| **100** | **0.98** | **182.65** | **-82.22** |
-| 200 | 0.90 | 224.32 | -116.82 |
-| 500 | 0.65 | 198.71 | -201.45 |
+| Config | Sharpe | Total PnL | MaxDD | FR PnL | FR% |
+|--------|--------|-----------|-------|--------|-----|
+| Baseline AS (no FR) | 0.25 | $606 | $1,077 | $12 | 2% |
+| FR-Biased (alpha=1) | 0.17 | $408 | $1,097 | $43 | 11% |
+| FR-Biased (alpha=5) | -0.01 | -$18 | $1,038 | $173 | N/A |
+| FR + Momentum | 0.15 | $350 | $1,071 | -$19 | -6% |
+| Conservative (γ=0.3) | 0.22 | $255 | $618 | -$15 | -6% |
+| **Aggressive (γ=0.05)** | **0.30** | **$1,123** | **$1,620** | **-$50** | **-4%** |
 
-**alpha=100 が最適。PnLの27%がFR収入。**
+**PnLの104%がスプレッド捕獲。FR carry は無視できるレベル（-4%）。**
+
+### レジーム依存性（重要）
+
+| レジーム | 時間 | PnL | Sharpe |
+|---------|------|-----|--------|
+| Bull | 9,512h | +$2,214 | 1.52 |
+| Consolidation | 5,510h | +$798 | 1.29 |
+| Recovery | 4,336h | -$526 | -1.25 |
+| Bear | 8,738h | -$1,394 | -1.19 |
+
+→ **Bull/Consolidation依存。Bear市場では損失。3年全体では正だがSOL上昇トレンドのバイアスあり。**
 
 ### Mark-Oracle Premium
 

@@ -232,7 +232,8 @@ class PaperTrader:
     def apply_funding(self, fr_value: float, price: float):
         """Apply hourly funding rate to inventory position.
 
-        Drift FR is hourly. Payment = inventory * fr * price.
+        Drift FR is hourly, already converted to a fraction (e.g., 0.00001 = 0.001%).
+        Payment = inventory * fr * price.
         Positive FR: longs pay shorts.
         If we are long (inventory > 0) and FR > 0, we pay.
         If we are long and FR < 0, we receive.
@@ -240,7 +241,7 @@ class PaperTrader:
         inv = self.state.inventory
         if abs(inv) < 1e-9:
             return
-        # payment = inv * fr * price (positive = we pay, negative = we receive)
+        # payment = inv * fr_fraction * price (positive = we pay, negative = we receive)
         payment = inv * fr_value * price
         self.state.cash -= payment
         self.state.fr_earnings -= payment  # track FR P&L separately
@@ -383,9 +384,12 @@ def load_data() -> dict:
     drift_candles = drift_candles.with_columns(
         pl.col("timestamp").dt.truncate("1h").cast(pl.Datetime("us", "UTC")).alias("ts_hour")
     )
-    drift_fr = drift_fr.with_columns(
-        pl.col("timestamp").dt.truncate("1h").cast(pl.Datetime("us", "UTC")).alias("ts_hour")
-    )
+    # Convert Drift FR from price units to percentage: fr_pct = funding_rate / oracle_price_twap
+    # Drift funding_rate is in USD per base asset per hour, not a dimensionless fraction.
+    drift_fr = drift_fr.with_columns([
+        pl.col("timestamp").dt.truncate("1h").cast(pl.Datetime("us", "UTC")).alias("ts_hour"),
+        (pl.col("funding_rate") / pl.col("oracle_price_twap")).alias("funding_rate"),
+    ])
     # Binance has no timezone - treat as UTC
     binance = binance.with_columns(
         pl.col("timestamp").dt.replace_time_zone("UTC").dt.truncate("1h").cast(pl.Datetime("us", "UTC")).alias("ts_hour")
@@ -627,17 +631,20 @@ def main():
     print(f"\n{'=' * 60}")
     print("KEY INSIGHTS")
     print(f"{'=' * 60}")
-    print("1. FR carry is the dominant PnL source (~100%) -- spread capture")
-    print("   is near break-even on Drift due to wide vAMM spreads (~100bp).")
-    print("2. FR-biased inventory (leaning short when FR > 0) captures")
-    print(f"   the persistently positive Drift FR (mean={data['fr'].mean():.4f}/hr,")
-    print(f"   {data['fr'].mean() * 8760 * 100:.0f}% annualized, {(data['fr'] > 0).mean() * 100:.0f}% positive hours).")
-    print("3. Conservative config (gamma=0.3, inv_limit=5) achieves best Sharpe")
-    print("   by limiting inventory risk while maintaining steady FR income.")
-    print("4. The VoV filter and momentum skew have minimal marginal impact")
-    print("   because the strategy is dominated by carry, not directional bets.")
-    print("5. Practical concern: these results assume continuous quoting and")
-    print("   perfect fill at limit prices -- real execution will be worse.")
+    mean_fr_pct = data['fr'].mean() * 100
+    ann_fr = mean_fr_pct * 8760
+    print(f"1. Drift FR is {ann_fr:.1f}% annualized ({mean_fr_pct:.5f}%/hr,")
+    print(f"   {(data['fr'] > 0).mean() * 100:.0f}% positive hours) -- modest, not dominant.")
+    print("2. PnL is ~100% spread capture, NOT FR carry. The strategy profits")
+    print("   from mean reversion on Drift's wide ~100bp vAMM spread.")
+    print("3. Strong regime dependency: Bull/Consolidation profitable (+$3k),")
+    print("   Bear/Recovery losing (-$1.9k). Net positive over 3yr due to")
+    print("   SOL's overall uptrend in this sample.")
+    print("4. Aggressive config (low gamma, high inv_limit) maximizes Sharpe")
+    print("   because wider inventory tolerance captures more spread.")
+    print("5. CAUTION: Results assume continuous quoting and perfect fills.")
+    print("   Real execution will face latency, partial fills, and adverse")
+    print("   selection not captured here. Bear-market losses are significant.")
 
 
 if __name__ == "__main__":
