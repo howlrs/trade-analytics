@@ -17,7 +17,7 @@ vi.mock('../../src/utils/logger.js', () => ({
   }),
 }))
 
-import { evaluateRebalanceTrigger, recordRebalanceForDay } from '../../src/strategy/trigger.js'
+import { evaluateRebalanceTrigger, recordRebalanceForDay, validateProfitabilityGateConfig } from '../../src/strategy/trigger.js'
 import { getCurrentPrice, tickToPrice } from '../../src/core/price.js'
 
 const mockedGetCurrentPrice = vi.mocked(getCurrentPrice)
@@ -1063,6 +1063,53 @@ describe('evaluateRebalanceTrigger', () => {
 
       expect(result.shouldRebalance).toBe(true)
       expect(result.trigger).toBe('range-out')
+    })
+  })
+
+  // ------------------------------------------------------------------
+  // 16. validateProfitabilityGateConfig
+  // ------------------------------------------------------------------
+  describe('validateProfitabilityGateConfig', () => {
+    it('should pass with updated default volumeRatio (0.035) for volTickWidthMin=480 + 0.25% fee', () => {
+      const result = validateProfitabilityGateConfig(
+        0.0025,  // poolFeeRate (0.25%)
+        480,     // tickWidthMin
+        60,      // tickSpacing
+        48,      // maxBreakevenHours
+        // no dailyVolumeRatio → uses new default 0.035
+      )
+      expect(result.ok).toBe(true)
+      expect(result.breakevenHours).toBeLessThan(48)
+    })
+
+    it('should fail with old default volumeRatio (0.02) for volTickWidthMin=480 + 0.25% fee', () => {
+      const result = validateProfitabilityGateConfig(
+        0.0025,
+        480,
+        60,
+        48,
+        0.02,  // explicitly use old default
+      )
+      expect(result.ok).toBe(false)
+      expect(result.breakevenHours).toBeGreaterThan(48)
+    })
+
+    it('should calculate correct breakeven hours for known inputs', () => {
+      // volumeRatio=0.035, rangeWidthPct = 480 * 0.0001 = 0.048
+      // capitalEfficiency = 1 / (2 * 0.048) = 10.42
+      // swapCostPct = 0.0025 * 0.5 = 0.00125
+      // dailyFeeRatePct = 0.0025 * 0.035 * 10.42 = 0.000912
+      // hourlyFeeRatePct = 0.000912 / 24 = 0.000038
+      // breakeven = 0.00125 / 0.000038 = ~32.9h
+      const result = validateProfitabilityGateConfig(0.0025, 480, 60, 48)
+      expect(result.breakevenHours).toBeCloseTo(32.9, 0)
+    })
+
+    it('should return ok=false for very wide ranges (low capital efficiency)', () => {
+      // Wider range = lower capital efficiency = harder to break even
+      const result = validateProfitabilityGateConfig(0.0025, 1200, 60)
+      expect(result.ok).toBe(false)
+      expect(result.breakevenHours).toBeGreaterThan(48)
     })
   })
 

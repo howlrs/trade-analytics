@@ -106,7 +106,7 @@ function estimateBreakevenHoursFallback(
   rangeWidthPct: number,
   dailyVolumeRatio?: number,
 ): number {
-  const volumeRatio = dailyVolumeRatio ?? 0.02
+  const volumeRatio = dailyVolumeRatio ?? 0.035
   const capitalEfficiency = 1 / (2 * rangeWidthPct)
   const swapCostPct = poolFeeRate * 0.5
   const dailyFeeRatePct = poolFeeRate * volumeRatio * capitalEfficiency
@@ -250,7 +250,7 @@ export function validateProfitabilityGateConfig(
       tickWidthMin,
       alignedMin,
       poolFeeRate,
-      dailyVolumeRatio: dailyVolumeRatio ?? 0.02,
+      dailyVolumeRatio: dailyVolumeRatio ?? 0.035,
       rangeWidthPct: rangeWidthPct.toFixed(4),
       breakevenHours: breakevenHours.toFixed(1),
       maxBreakevenHours,
