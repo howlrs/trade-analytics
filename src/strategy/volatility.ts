@@ -27,9 +27,76 @@ const SIGMA_TIERS: { maxSigma: number; tickWidth: number }[] = [
 ]
 const MAX_TICK_WIDTH = 1200
 
-interface VolatilityResult {
+export interface VolatilityResult {
   tickWidth: number
   sigma: number
+}
+
+/**
+ * Continuous linear interpolation from sigma to tick width.
+ * Replaces the discrete tier table when volScalingMode === 'continuous'.
+ *
+ *   t = clamp((sigma - sigmaLow) / (sigmaHigh - sigmaLow), 0, 1)
+ *   tickWidth = round(minWidth + (maxWidth - minWidth) * t)
+ */
+export function sigmaToTickWidth(
+  sigma: number,
+  sigmaLow: number,
+  sigmaHigh: number,
+  minWidth: number,
+  maxWidth: number,
+): number {
+  const t = Math.max(0, Math.min(1, (sigma - sigmaLow) / (sigmaHigh - sigmaLow)))
+  return Math.round(minWidth + (maxWidth - minWidth) * t)
+}
+
+/**
+ * Fetch 24h hourly klines from Binance REST API and compute
+ * log-return standard deviation in tick units.
+ * Returns sigma (per hour, in tick units) or null on failure.
+ */
+export async function fetchBinanceSigma(): Promise<number | null> {
+  const log = getLogger()
+  try {
+    const url = 'https://api.binance.com/api/v3/klines?symbol=SUIUSDT&interval=1h&limit=24'
+    const res = await fetch(url)
+    if (!res.ok) {
+      log.warn('Binance kline fetch failed', { status: res.status })
+      return null
+    }
+    const klines = await res.json() as Array<[number, string, string, string, string, ...unknown[]]>
+    if (klines.length < 2) return null
+
+    // Compute log returns from close prices
+    const closes = klines.map(k => parseFloat(k[4]))
+    const logReturns: number[] = []
+    for (let i = 1; i < closes.length; i++) {
+      if (closes[i - 1] > 0) {
+        logReturns.push(Math.log(closes[i] / closes[i - 1]))
+      }
+    }
+    if (logReturns.length < 2) return null
+
+    const mean = logReturns.reduce((a, b) => a + b, 0) / logReturns.length
+    const variance = logReturns.reduce((sum, v) => sum + (v - mean) ** 2, 0) / logReturns.length
+    const std = Math.sqrt(variance)
+
+    // Convert from price-return std to tick units (1 tick ≈ 1 bps = 0.0001)
+    const sigmaInTicks = std / 0.0001
+
+    log.info('Binance sigma computed', {
+      klines: klines.length,
+      sigmaInTicks: sigmaInTicks.toFixed(2),
+      priceStd: std.toFixed(6),
+    })
+
+    return sigmaInTicks
+  } catch (err) {
+    log.warn('Binance sigma fetch error', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+    return null
+  }
 }
 
 /**
@@ -59,6 +126,9 @@ async function fetchAndComputeVolatility(
   hours: number,
   tickWidthMin?: number,
   tickWidthMax?: number,
+  scalingMode?: 'tiered' | 'continuous',
+  sigmaLow?: number,
+  sigmaHigh?: number,
 ): Promise<VolatilityResult | null> {
   const log = getLogger()
   const cutoffMs = Date.now() - hours * 60 * 60 * 1000
@@ -135,16 +205,23 @@ async function fetchAndComputeVolatility(
   const spanHours = Math.max((newestTs - oldestTs) / (60 * 60 * 1000), 0.1)
   const sigmaPerHour = sigma * Math.sqrt(ticks.length / spanHours)
 
+  const effectiveMin = tickWidthMin ?? SIGMA_TIERS[0].tickWidth
   const effectiveMax = tickWidthMax ?? MAX_TICK_WIDTH
-  let tickWidth = effectiveMax
-  for (const tier of SIGMA_TIERS) {
-    if (sigmaPerHour < tier.maxSigma) {
-      tickWidth = tier.tickWidth
-      break
+  let tickWidth: number
+  if (scalingMode === 'continuous') {
+    const effSigmaLow = sigmaLow ?? 40
+    const effSigmaHigh = sigmaHigh ?? 120
+    tickWidth = sigmaToTickWidth(sigmaPerHour, effSigmaLow, effSigmaHigh, effectiveMin, effectiveMax)
+  } else {
+    // Tiered (legacy) mode
+    tickWidth = effectiveMax
+    for (const tier of SIGMA_TIERS) {
+      if (sigmaPerHour < tier.maxSigma) {
+        tickWidth = tier.tickWidth
+        break
+      }
     }
   }
-
-  const effectiveMin = tickWidthMin ?? SIGMA_TIERS[0].tickWidth
   tickWidth = Math.max(effectiveMin, Math.min(effectiveMax, tickWidth))
 
   const alignedWidth =
@@ -182,6 +259,10 @@ export async function calculateVolatilityBasedTicks(
   lookbackHours?: number,
   tickWidthMin?: number,
   tickWidthMax?: number,
+  scalingMode?: 'tiered' | 'continuous',
+  sigmaLow?: number,
+  sigmaHigh?: number,
+  binanceVolFallback?: boolean,
 ): Promise<VolatilityResult | null> {
   const log = getLogger()
   const baseHours = lookbackHours ?? DEFAULT_LOOKBACK_HOURS
@@ -191,6 +272,7 @@ export async function calculateVolatilityBasedTicks(
     // Try with the configured lookback first
     let result = await fetchAndComputeVolatility(
       poolId, tickSpacing, baseHours, tickWidthMin, tickWidthMax,
+      scalingMode, sigmaLow, sigmaHigh,
     )
 
     // If insufficient data, retry with extended lookback windows
@@ -203,8 +285,44 @@ export async function calculateVolatilityBasedTicks(
         })
         result = await fetchAndComputeVolatility(
           poolId, tickSpacing, extendedHours, tickWidthMin, tickWidthMax,
+          scalingMode, sigmaLow, sigmaHigh,
         )
         if (result) break
+      }
+    }
+
+    // Binance fallback blending (opt-in)
+    if (result && binanceVolFallback) {
+      const binanceSigma = await fetchBinanceSigma()
+      if (binanceSigma != null) {
+        // Blend: on-chain 70% + Binance 30%
+        const blendedSigma = result.sigma * 0.7 + binanceSigma * 0.3
+        const effMax = tickWidthMax ?? MAX_TICK_WIDTH
+        const effMin = tickWidthMin ?? SIGMA_TIERS[0].tickWidth
+        let blendedWidth: number
+        if (scalingMode === 'continuous') {
+          blendedWidth = sigmaToTickWidth(
+            blendedSigma, sigmaLow ?? 40, sigmaHigh ?? 120, effMin, effMax,
+          )
+        } else {
+          blendedWidth = effMax
+          for (const tier of SIGMA_TIERS) {
+            if (blendedSigma < tier.maxSigma) {
+              blendedWidth = tier.tickWidth
+              break
+            }
+          }
+        }
+        blendedWidth = Math.max(effMin, Math.min(effMax, blendedWidth))
+        const alignedBlended = Math.max(Math.floor(blendedWidth / tickSpacing), 1) * tickSpacing
+        log.info('Volatility: Binance blending applied', {
+          onChainSigma: result.sigma.toFixed(2),
+          binanceSigma: binanceSigma.toFixed(2),
+          blendedSigma: blendedSigma.toFixed(2),
+          originalWidth: result.tickWidth,
+          blendedWidth: alignedBlended,
+        })
+        result = { tickWidth: alignedBlended, sigma: blendedSigma }
       }
     }
 

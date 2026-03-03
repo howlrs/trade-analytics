@@ -189,6 +189,81 @@ describe('calculateOptimalRange', () => {
     expect(mockGetTickFromPrice.mock.calls[0][0]).toBeCloseTo(1.05 * 0.97, 4)
     expect(mockGetTickFromPrice.mock.calls[1][0]).toBeCloseTo(1.05 * 1.03, 4)
   })
+
+  // --- Regime multiplier tests ---
+
+  it('compression regime (0.75x) narrows tick width', () => {
+    const pool = makePool({ currentTickIndex: 1000, tickSpacing: 60 })
+    const config = makePoolConfig({ strategy: 'dynamic', regimeEnabled: true, volTickWidthMin: 480, volTickWidthMax: 1200 })
+
+    const regimeState = { regime: 'low' as const, isCompression: true, isTransition: false, currentSigma: 10 }
+    calculateOptimalRange(pool, config, DECIMALS_A, DECIMALS_B, 800, regimeState)
+
+    // adjustedWidth = round(800 * 0.75) = 600, halfWidth = 300
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(700, 60) // 1000 - 300
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(1300, 60) // 1000 + 300
+  })
+
+  it('high vol regime (1.15x) widens tick width', () => {
+    const pool = makePool({ currentTickIndex: 1000, tickSpacing: 60 })
+    const config = makePoolConfig({ strategy: 'dynamic', regimeEnabled: true, volTickWidthMin: 480, volTickWidthMax: 1200 })
+
+    const regimeState = { regime: 'high' as const, isCompression: false, isTransition: false, currentSigma: 150 }
+    calculateOptimalRange(pool, config, DECIMALS_A, DECIMALS_B, 800, regimeState)
+
+    // adjustedWidth = round(800 * 1.15) = 920, halfWidth = 460
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(540, 60) // 1000 - 460
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(1460, 60) // 1000 + 460
+  })
+
+  it('transition regime (1.3x) widens tick width further', () => {
+    const pool = makePool({ currentTickIndex: 1000, tickSpacing: 60 })
+    const config = makePoolConfig({ strategy: 'dynamic', regimeEnabled: true, volTickWidthMin: 480, volTickWidthMax: 1200 })
+
+    const regimeState = { regime: 'high' as const, isCompression: false, isTransition: true, currentSigma: 200 }
+    calculateOptimalRange(pool, config, DECIMALS_A, DECIMALS_B, 800, regimeState)
+
+    // adjustedWidth = round(800 * 1.3) = 1040, halfWidth = 520
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(480, 60) // 1000 - 520
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(1520, 60) // 1000 + 520
+  })
+
+  it('mid regime (1.0x) does not change tick width', () => {
+    const pool = makePool({ currentTickIndex: 1000, tickSpacing: 60 })
+    const config = makePoolConfig({ strategy: 'dynamic', regimeEnabled: true, volTickWidthMin: 480, volTickWidthMax: 1200 })
+
+    const regimeState = { regime: 'mid' as const, isCompression: false, isTransition: false, currentSigma: 60 }
+    calculateOptimalRange(pool, config, DECIMALS_A, DECIMALS_B, 800, regimeState)
+
+    // adjustedWidth = 800 * 1.0 = 800, halfWidth = 400
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(600, 60) // 1000 - 400
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(1400, 60) // 1000 + 400
+  })
+
+  it('regimeEnabled=false ignores regime multiplier', () => {
+    const pool = makePool({ currentTickIndex: 1000, tickSpacing: 60 })
+    const config = makePoolConfig({ strategy: 'dynamic', regimeEnabled: false, volTickWidthMin: 480, volTickWidthMax: 1200 })
+
+    const regimeState = { regime: 'low' as const, isCompression: true, isTransition: false, currentSigma: 10 }
+    calculateOptimalRange(pool, config, DECIMALS_A, DECIMALS_B, 800, regimeState)
+
+    // No multiplier applied: halfWidth = 400
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(600, 60) // 1000 - 400
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(1400, 60) // 1000 + 400
+  })
+
+  it('regime-adjusted width is clamped to volTickWidthMax', () => {
+    const pool = makePool({ currentTickIndex: 1000, tickSpacing: 60 })
+    const config = makePoolConfig({ strategy: 'dynamic', regimeEnabled: true, volTickWidthMin: 480, volTickWidthMax: 1200 })
+
+    // 1100 * 1.3 = 1430, but clamped to 1200
+    const regimeState = { regime: 'high' as const, isCompression: false, isTransition: true, currentSigma: 200 }
+    calculateOptimalRange(pool, config, DECIMALS_A, DECIMALS_B, 1100, regimeState)
+
+    // adjustedWidth = min(1430, 1200) = 1200, halfWidth = 600
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(400, 60) // 1000 - 600
+    expect(mockAlignTickToSpacing).toHaveBeenCalledWith(1600, 60) // 1000 + 600
+  })
 })
 
 // ── calculateSwapPlan ───────────────────────────────────────────────

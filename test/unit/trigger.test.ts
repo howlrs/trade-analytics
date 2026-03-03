@@ -17,7 +17,7 @@ vi.mock('../../src/utils/logger.js', () => ({
   }),
 }))
 
-import { evaluateRebalanceTrigger, recordRebalanceForDay } from '../../src/strategy/trigger.js'
+import { evaluateRebalanceTrigger, recordRebalanceForDay, validateProfitabilityGateConfig } from '../../src/strategy/trigger.js'
 import { getCurrentPrice, tickToPrice } from '../../src/core/price.js'
 
 const mockedGetCurrentPrice = vi.mocked(getCurrentPrice)
@@ -954,6 +954,162 @@ describe('evaluateRebalanceTrigger', () => {
       // Range-out should bypass the daily limit
       expect(result.shouldRebalance).toBe(true)
       expect(result.trigger).toBe('range-out')
+    })
+  })
+
+  // ------------------------------------------------------------------
+  // 15. Regime-aware cooldown
+  // ------------------------------------------------------------------
+  describe('regime-aware cooldown', () => {
+    it('should extend cooldown in high vol regime (1.5x)', () => {
+      // Establish upward direction
+      setupPriceMocks(2.5, 1.0, 2.0)
+      const pos = makePosition({ positionId: '0xregime_cd_1' })
+      evaluateRebalanceTrigger(makePool(), pos, {
+        rebalanceThreshold: 0.15,
+        decimalsA,
+        decimalsB,
+        waitAfterRangeoutSec: 0,
+      })
+
+      // UP cooldown is 60min base. High vol = 1.5x = 90min.
+      // 70min ago → should still be blocked (70 < 90)
+      const seventyMinAgo = Date.now() - 70 * 60 * 1000
+      setupPriceMocks(2.5, 1.0, 2.0)
+
+      const result = evaluateRebalanceTrigger(makePool(), pos, {
+        rebalanceThreshold: 0.15,
+        decimalsA,
+        decimalsB,
+        lastRebalanceTime: seventyMinAgo,
+        waitAfterRangeoutSec: 0,
+        regimeState: { regime: 'high', isCompression: false, isTransition: false, currentSigma: 150 },
+      })
+
+      expect(result.shouldRebalance).toBe(false)
+      expect(result.reason).toContain('Cooldown')
+    })
+
+    it('should shorten cooldown in low vol regime (0.67x)', () => {
+      // Establish downward direction
+      setupPriceMocks(0.5, 1.0, 2.0)
+      const pos = makePosition({ positionId: '0xregime_cd_2' })
+      evaluateRebalanceTrigger(makePool(), pos, {
+        rebalanceThreshold: 0.15,
+        decimalsA,
+        decimalsB,
+        waitAfterRangeoutSec: 0,
+      })
+
+      // DOWN cooldown is 30min base. Low vol = 0.67x ≈ 20min.
+      // 25min ago → should allow (25 > 20)
+      const twentyFiveMinAgo = Date.now() - 25 * 60 * 1000
+      setupPriceMocks(0.5, 1.0, 2.0)
+
+      const result = evaluateRebalanceTrigger(makePool(), pos, {
+        rebalanceThreshold: 0.15,
+        decimalsA,
+        decimalsB,
+        lastRebalanceTime: twentyFiveMinAgo,
+        waitAfterRangeoutSec: 0,
+        regimeState: { regime: 'low', isCompression: false, isTransition: false, currentSigma: 20 },
+      })
+
+      expect(result.shouldRebalance).toBe(true)
+      expect(result.trigger).toBe('range-out')
+    })
+
+    it('should double waitAfterRangeout during transition', () => {
+      setupPriceMocks(0.5, 1.0, 2.0)
+      const pos = makePosition({ positionId: '0xregime_cd_3' })
+
+      const result = evaluateRebalanceTrigger(makePool(), pos, {
+        rebalanceThreshold: 0.15,
+        decimalsA,
+        decimalsB,
+        waitAfterRangeoutSec: 1800,
+        regimeState: { regime: 'high', isCompression: false, isTransition: true, currentSigma: 200 },
+      })
+
+      expect(result.shouldRebalance).toBe(false)
+      // Should reference 3600s (1800 * 2) in the reason
+      expect(result.reason).toContain('3600s')
+    })
+
+    it('should use normal cooldown when regimeState is not provided', () => {
+      // Establish downward direction
+      setupPriceMocks(0.5, 1.0, 2.0)
+      const pos = makePosition({ positionId: '0xregime_cd_4' })
+      evaluateRebalanceTrigger(makePool(), pos, {
+        rebalanceThreshold: 0.15,
+        decimalsA,
+        decimalsB,
+        waitAfterRangeoutSec: 0,
+      })
+
+      // DOWN cooldown is 30min base. No regime → 1.0x = 30min.
+      // 31min ago → should allow
+      const thirtyOneMinAgo = Date.now() - 31 * 60 * 1000
+      setupPriceMocks(0.5, 1.0, 2.0)
+
+      const result = evaluateRebalanceTrigger(makePool(), pos, {
+        rebalanceThreshold: 0.15,
+        decimalsA,
+        decimalsB,
+        lastRebalanceTime: thirtyOneMinAgo,
+        waitAfterRangeoutSec: 0,
+        // no regimeState
+      })
+
+      expect(result.shouldRebalance).toBe(true)
+      expect(result.trigger).toBe('range-out')
+    })
+  })
+
+  // ------------------------------------------------------------------
+  // 16. validateProfitabilityGateConfig
+  // ------------------------------------------------------------------
+  describe('validateProfitabilityGateConfig', () => {
+    it('should pass with updated default volumeRatio (0.035) for volTickWidthMin=480 + 0.25% fee', () => {
+      const result = validateProfitabilityGateConfig(
+        0.0025,  // poolFeeRate (0.25%)
+        480,     // tickWidthMin
+        60,      // tickSpacing
+        48,      // maxBreakevenHours
+        // no dailyVolumeRatio → uses new default 0.035
+      )
+      expect(result.ok).toBe(true)
+      expect(result.breakevenHours).toBeLessThan(48)
+    })
+
+    it('should fail with old default volumeRatio (0.02) for volTickWidthMin=480 + 0.25% fee', () => {
+      const result = validateProfitabilityGateConfig(
+        0.0025,
+        480,
+        60,
+        48,
+        0.02,  // explicitly use old default
+      )
+      expect(result.ok).toBe(false)
+      expect(result.breakevenHours).toBeGreaterThan(48)
+    })
+
+    it('should calculate correct breakeven hours for known inputs', () => {
+      // volumeRatio=0.035, rangeWidthPct = 480 * 0.0001 = 0.048
+      // capitalEfficiency = 1 / (2 * 0.048) = 10.42
+      // swapCostPct = 0.0025 * 0.5 = 0.00125
+      // dailyFeeRatePct = 0.0025 * 0.035 * 10.42 = 0.000912
+      // hourlyFeeRatePct = 0.000912 / 24 = 0.000038
+      // breakeven = 0.00125 / 0.000038 = ~32.9h
+      const result = validateProfitabilityGateConfig(0.0025, 480, 60, 48)
+      expect(result.breakevenHours).toBeCloseTo(32.9, 0)
+    })
+
+    it('should return ok=false for very wide ranges (low capital efficiency)', () => {
+      // Wider range = lower capital efficiency = harder to break even
+      const result = validateProfitabilityGateConfig(0.0025, 1200, 60)
+      expect(result.ok).toBe(false)
+      expect(result.breakevenHours).toBeGreaterThan(48)
     })
   })
 

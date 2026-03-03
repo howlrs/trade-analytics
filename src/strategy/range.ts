@@ -1,5 +1,7 @@
 import type { RangeStrategy, PoolInfo } from '../types/index.js'
 import type { PoolConfig } from '../types/config.js'
+import type { RegimeState } from './regime.js'
+import { getRegimeMultiplier } from './regime.js'
 import { tickToPrice, getTickFromPrice, getCurrentPrice, alignTickToSpacing } from '../core/price.js'
 import { getLogger } from '../utils/logger.js'
 
@@ -17,6 +19,7 @@ export function calculateOptimalRange(
   decimalsA: number,
   decimalsB: number,
   volatilityTickWidth?: number,
+  regimeState?: RegimeState,
 ): RangeResult {
   const log = getLogger()
   const currentPrice = getCurrentPrice(pool, decimalsA, decimalsB)
@@ -24,7 +27,17 @@ export function calculateOptimalRange(
 
   // For dynamic strategy with volatility data, use tick-based range directly
   if (strategy === 'dynamic' && volatilityTickWidth != null) {
-    const halfWidth = Math.floor(volatilityTickWidth / 2)
+    // Apply regime multiplier if regime detection is active
+    let adjustedWidth = volatilityTickWidth
+    let multiplier = 1.0
+    if (regimeState && poolConfig.regimeEnabled) {
+      multiplier = getRegimeMultiplier(regimeState)
+      adjustedWidth = Math.round(volatilityTickWidth * multiplier)
+      // Clamp to [volTickWidthMin, volTickWidthMax]
+      adjustedWidth = Math.max(poolConfig.volTickWidthMin, Math.min(poolConfig.volTickWidthMax, adjustedWidth))
+    }
+
+    const halfWidth = Math.floor(adjustedWidth / 2)
     const tickLower = alignTickToSpacing(pool.currentTickIndex - halfWidth, pool.tickSpacing)
     const tickUpper = alignTickToSpacing(pool.currentTickIndex + halfWidth, pool.tickSpacing)
 
@@ -35,6 +48,11 @@ export function calculateOptimalRange(
       strategy,
       currentPrice,
       volatilityTickWidth,
+      adjustedWidth,
+      regimeMultiplier: multiplier,
+      regime: regimeState?.regime,
+      isCompression: regimeState?.isCompression,
+      isTransition: regimeState?.isTransition,
       tickLower,
       tickUpper,
       priceLower: actualLower,

@@ -74,6 +74,50 @@ describe('PoolConfigSchema', () => {
   it('rejects volLookbackHours above 24', () => {
     expect(() => PoolConfigSchema.parse({ poolId: '0xabc', volLookbackHours: 48 })).toThrow()
   })
+
+  // --- New regime/vol fields ---
+
+  it('applies defaults for new regime fields', () => {
+    const result = PoolConfigSchema.parse({ poolId: '0xabc' })
+    expect(result.volScalingMode).toBe('continuous')
+    expect(result.sigmaLow).toBe(40)
+    expect(result.sigmaHigh).toBe(120)
+    expect(result.regimeEnabled).toBe(true)
+    expect(result.binanceVolFallback).toBe(false)
+  })
+
+  it('accepts volScalingMode=tiered', () => {
+    const result = PoolConfigSchema.parse({ poolId: '0xabc', volScalingMode: 'tiered' })
+    expect(result.volScalingMode).toBe('tiered')
+  })
+
+  it('rejects invalid volScalingMode', () => {
+    expect(() => PoolConfigSchema.parse({ poolId: '0xabc', volScalingMode: 'invalid' })).toThrow()
+  })
+
+  it('rejects sigmaLow below 1', () => {
+    expect(() => PoolConfigSchema.parse({ poolId: '0xabc', sigmaLow: 0 })).toThrow()
+  })
+
+  it('rejects sigmaHigh above 500', () => {
+    expect(() => PoolConfigSchema.parse({ poolId: '0xabc', sigmaHigh: 501 })).toThrow()
+  })
+
+  it('accepts custom sigma values', () => {
+    const result = PoolConfigSchema.parse({ poolId: '0xabc', sigmaLow: 20, sigmaHigh: 200 })
+    expect(result.sigmaLow).toBe(20)
+    expect(result.sigmaHigh).toBe(200)
+  })
+
+  it('accepts regimeEnabled=false', () => {
+    const result = PoolConfigSchema.parse({ poolId: '0xabc', regimeEnabled: false })
+    expect(result.regimeEnabled).toBe(false)
+  })
+
+  it('accepts binanceVolFallback=true', () => {
+    const result = PoolConfigSchema.parse({ poolId: '0xabc', binanceVolFallback: true })
+    expect(result.binanceVolFallback).toBe(true)
+  })
 })
 
 // ── ConfigSchema ────────────────────────────────────────────────────

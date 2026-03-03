@@ -18,12 +18,26 @@ export function loadConfig(): Config {
     .map(id => id.trim())
     .filter(Boolean)
 
+  // Parse per-pool regime/vol config from environment
+  const volScalingMode = process.env.VOL_SCALING_MODE as 'tiered' | 'continuous' | undefined
+  const sigmaLowEnv = process.env.SIGMA_LOW ? parseFloat(process.env.SIGMA_LOW) : undefined
+  const sigmaHighEnv = process.env.SIGMA_HIGH ? parseFloat(process.env.SIGMA_HIGH) : undefined
+  const regimeEnabledEnv = process.env.REGIME_ENABLED !== undefined
+    ? process.env.REGIME_ENABLED !== 'false'
+    : undefined
+  const binanceVolFallbackEnv = process.env.BINANCE_VOL_FALLBACK === 'true' ? true : undefined
+
   const raw = {
     network: process.env.SUI_NETWORK ?? 'testnet',
     privateKey: process.env.SUI_PRIVATE_KEY ?? '',
     pools: poolIds.map(poolId => ({
       poolId,
       ...(positionIds.length > 0 ? { positionIds } : {}),
+      ...(volScalingMode ? { volScalingMode } : {}),
+      ...(sigmaLowEnv != null ? { sigmaLow: sigmaLowEnv } : {}),
+      ...(sigmaHighEnv != null ? { sigmaHigh: sigmaHighEnv } : {}),
+      ...(regimeEnabledEnv != null ? { regimeEnabled: regimeEnabledEnv } : {}),
+      ...(binanceVolFallbackEnv != null ? { binanceVolFallback: binanceVolFallbackEnv } : {}),
     })),
     rebalanceThreshold: parseFloat(process.env.REBALANCE_THRESHOLD ?? '0.03'),
     harvestIntervalSec: parseInt(process.env.HARVEST_INTERVAL ?? process.env.COMPOUND_INTERVAL ?? '7200', 10),

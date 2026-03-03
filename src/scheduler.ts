@@ -10,6 +10,8 @@ import { checkAndHarvest } from './core/compound.js'
 import { estimatePositionAmounts } from './core/price.js'
 import { coinBPriceInCoinA } from './core/price.js'
 import { calculateVolatilityBasedTicks } from './strategy/volatility.js'
+import { detectRegime } from './strategy/regime.js'
+import type { RegimeState } from './strategy/regime.js'
 import { feeTracker } from './utils/fee-tracker.js'
 import { savePositionId } from './utils/state.js'
 import { getLogger } from './utils/logger.js'
@@ -89,17 +91,20 @@ export function startScheduler(config: Config, keypair: Ed25519Keypair): () => v
 
   // Volatility cache for range-fit trigger (5-minute TTL)
   const VOL_CACHE_TTL = 300_000
-  let volCache: { tickWidth: number; fetchedAt: number } | null = null
+  let volCache: { tickWidth: number; sigma: number; fetchedAt: number } | null = null
   const volHistory: number[] = []
+  const sigmaHistory: number[] = []
   const VOL_HISTORY_MAX = 10
+  const SIGMA_HISTORY_MAX = 24
 
   async function getOptimalTickWidth(
     poolId: string,
     tickSpacing: number,
     poolConfig: import('./types/config.js').PoolConfig,
-  ): Promise<{ tickWidth: number; stabilityCount: number } | null> {
+  ): Promise<{ tickWidth: number; stabilityCount: number; sigma: number; regimeState: RegimeState } | null> {
     if (volCache && Date.now() - volCache.fetchedAt < VOL_CACHE_TTL) {
-      return { tickWidth: volCache.tickWidth, stabilityCount: getStabilityCount(volCache.tickWidth) }
+      const regimeState = poolConfig.regimeEnabled ? detectRegime(sigmaHistory) : { regime: 'mid' as const, isCompression: false, isTransition: false, currentSigma: volCache.sigma }
+      return { tickWidth: volCache.tickWidth, stabilityCount: getStabilityCount(volCache.tickWidth), sigma: volCache.sigma, regimeState }
     }
     const result = await calculateVolatilityBasedTicks(
       poolId,
@@ -107,12 +112,22 @@ export function startScheduler(config: Config, keypair: Ed25519Keypair): () => v
       poolConfig.volLookbackHours,
       poolConfig.volTickWidthMin,
       poolConfig.volTickWidthMax,
+      poolConfig.volScalingMode,
+      poolConfig.sigmaLow,
+      poolConfig.sigmaHigh,
+      poolConfig.binanceVolFallback,
     )
     if (result) {
-      volCache = { tickWidth: result.tickWidth, fetchedAt: Date.now() }
+      volCache = { tickWidth: result.tickWidth, sigma: result.sigma, fetchedAt: Date.now() }
       volHistory.push(result.tickWidth)
       if (volHistory.length > VOL_HISTORY_MAX) volHistory.shift()
-      return { tickWidth: result.tickWidth, stabilityCount: getStabilityCount(result.tickWidth) }
+      // Track sigma history for regime detection
+      if (result.sigma > 0) {
+        sigmaHistory.push(result.sigma)
+        if (sigmaHistory.length > SIGMA_HISTORY_MAX) sigmaHistory.shift()
+      }
+      const regimeState = poolConfig.regimeEnabled ? detectRegime(sigmaHistory) : { regime: 'mid' as const, isCompression: false, isTransition: false, currentSigma: result.sigma }
+      return { tickWidth: result.tickWidth, stabilityCount: getStabilityCount(result.tickWidth), sigma: result.sigma, regimeState }
     }
     return null
   }
@@ -233,7 +248,7 @@ export function startScheduler(config: Config, keypair: Ed25519Keypair): () => v
             poolConfig,
             keypair,
             { observedHourlyFeeUsd, positionValueUsd },
-            { positionOpenedAt, optimalTickWidth: volData?.tickWidth, volStabilityCount: volData?.stabilityCount },
+            { positionOpenedAt, optimalTickWidth: volData?.tickWidth, volStabilityCount: volData?.stabilityCount, regimeState: volData?.regimeState },
           )
 
           // Update managed position ID if rebalance created a new position

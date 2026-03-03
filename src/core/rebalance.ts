@@ -1,5 +1,6 @@
 import type { PoolInfo, PositionInfo, RebalanceDecision, TransactionResult } from '../types/index.js'
 import type { Config, PoolConfig } from '../types/config.js'
+import type { RegimeState } from '../strategy/regime.js'
 import { evaluateRebalanceTrigger, recordRebalanceForDay, transferDailyState } from '../strategy/trigger.js'
 import { calculateOptimalRange } from '../strategy/range.js'
 import { calculateVolatilityBasedTicks } from '../strategy/volatility.js'
@@ -227,6 +228,25 @@ export async function deployIdleFunds(
       }
     }
 
+    // Zero balance defense: RPC may return stale 0 balances after swap/close
+    if (deployA === 0n && deployB === 0n) {
+      log.info('Idle deploy: both balances are zero, re-querying after RPC settle', { iteration })
+      await new Promise(r => setTimeout(r, 3000))
+      const retryWallet = await getWalletBalances(owner, pool.coinTypeA, pool.coinTypeB)
+      deployA = retryWallet.balanceA
+      deployB = retryWallet.balanceB > GAS_RESERVE ? retryWallet.balanceB - GAS_RESERVE : 0n
+
+      if (deployA === 0n && deployB === 0n) {
+        log.info('Idle deploy: balances still zero after re-query, skipping iteration', { iteration })
+        continue
+      }
+      log.info('Idle deploy: balances recovered after re-query', {
+        iteration,
+        deployA_USDC: (Number(deployA) / 1e6).toFixed(4),
+        deployB_SUI: (Number(deployB) / 1e9).toFixed(4),
+      })
+    }
+
     let result = await addLiquidity(
       pool.poolId,
       positionId,
@@ -323,6 +343,7 @@ export interface GuardrailContext {
   positionOpenedAt?: number
   optimalTickWidth?: number
   volStabilityCount?: number
+  regimeState?: RegimeState
 }
 
 export async function checkAndRebalance(
@@ -353,6 +374,7 @@ export async function checkAndRebalance(
     volStabilityCount: guardrailContext?.volStabilityCount,
     fallbackDailyVolumeRatio: config.fallbackDailyVolumeRatio,
     maxBreakevenHours: config.maxBreakevenHours,
+    regimeState: guardrailContext?.regimeState,
   })
 
   log.info('Rebalance evaluation', {
@@ -461,7 +483,7 @@ export async function checkAndRebalance(
   }
 
   // Calculate new optimal range
-  const newRange = calculateOptimalRange(pool, poolConfig, DECIMALS_A, DECIMALS_B, volatilityTickWidth)
+  const newRange = calculateOptimalRange(pool, poolConfig, DECIMALS_A, DECIMALS_B, volatilityTickWidth, guardrailContext?.regimeState)
   decision.newLower = newRange.priceLower
   decision.newUpper = newRange.priceUpper
 
@@ -834,8 +856,49 @@ export async function checkAndRebalance(
   )
 
   if (!finalOpenResult.success) {
+    // --- RPC delay retry: re-query balances and retry once (all triggers) ---
+    if (finalOpenResult.error?.includes('Insufficient balance')) {
+      log.info('Open failed with Insufficient balance — retrying after RPC settle', {
+        error: finalOpenResult.error,
+      })
+      await new Promise(r => setTimeout(r, 3000))
+
+      const retryWallet = await getWalletBalances(owner, pool.coinTypeA, pool.coinTypeB)
+      if (position.liquidity === 0n) {
+        finalBalanceA = retryWallet.balanceA
+        const rawB = retryWallet.balanceB
+        finalBalanceB = rawB > GAS_RESERVE ? rawB - GAS_RESERVE : 0n
+      } else {
+        const deltaA = retryWallet.balanceA - preClose.balanceA
+        const deltaB = retryWallet.balanceB - preClose.balanceB
+        finalBalanceA = deltaA > 0n ? deltaA : 0n
+        const rawB = deltaB > 0n ? deltaB : 0n
+        finalBalanceB = rawB > GAS_RESERVE ? rawB - GAS_RESERVE : 0n
+      }
+
+      log.info('RPC retry: re-queried balances', {
+        amountA_USDC: (Number(finalBalanceA) / 1e6).toFixed(4),
+        amountB_SUI: (Number(finalBalanceB) / 1e9).toFixed(4),
+      })
+
+      finalOpenResult = await openPosition(
+        pool.poolId,
+        pool.coinTypeA,
+        pool.coinTypeB,
+        newRange.tickLower,
+        newRange.tickUpper,
+        finalBalanceA.toString(),
+        finalBalanceB.toString(),
+        config.slippageTolerance,
+        keypair,
+        config.dryRun,
+        pool.rewarderCoinTypes,
+        pool.currentSqrtPrice,
+      )
+    }
+
     // --- Swap fallback for range-out trigger in swap-free mode ---
-    if (swapFree && decision.trigger === 'range-out') {
+    if (!finalOpenResult.success && swapFree && decision.trigger === 'range-out') {
       log.warn('Swap-free open failed on range-out, falling back to swap', {
         error: finalOpenResult.error,
       })
@@ -937,7 +1000,10 @@ export async function checkAndRebalance(
       // Success via fallback
       swapFree = false
       finalOpenResult = retryResult
-    } else {
+    }
+
+    // Final failure — all retries exhausted
+    if (!finalOpenResult.success) {
       log.error('CRITICAL: Position closed + swapped but failed to open new one!', {
         poolId: pool.poolId,
         error: finalOpenResult.error,
