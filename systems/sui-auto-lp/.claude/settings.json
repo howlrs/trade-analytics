@@ -16,7 +16,12 @@
       "Bash(GCE_PASSPHRASE=* bash deploy/logs.sh *)",
       "Bash(gcloud compute ssh *)",
       "Bash(cat * | gemini -p *)",
-      "Bash(gemini -p *)"
+      "Bash(gemini -p *)",
+      "Bash(gemini -m * *)",
+      "Bash(git diff * | gemini *)",
+      "Bash(bash deploy/pre-deploy-check.sh)",
+      "Bash(python3 .claude/tools/screening.py *)",
+      "Bash(python3 .claude/tools/watcher.py *)"
     ],
     "deny": [
       "Bash(sui client publish *)",
@@ -24,6 +29,21 @@
       "Bash(sui client transfer *)",
       "Bash(sui client pay *)",
       "Bash(rm -rf *)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/boot-inject.sh",
+            "timeout": 10,
+            "statusMessage": "Loading LP state..."
+          }
+        ]
+      }
     ]
   }
 }
